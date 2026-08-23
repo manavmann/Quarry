@@ -2,6 +2,18 @@
 
 Read this first each session. Newest entry on top.
 
+## C03 · store: SQLite schema, migrations, runs/jobs/runners/events — done
+
+- Landed: `internal/store` over `modernc.org/sqlite` — single-conn pool,
+  WAL/busy_timeout/foreign_keys pragmas via DSN, embedded migrations
+  (`migrations/0001_init.sql`: runs, jobs, job_deps, runners, events;
+  each applied in its own tx with a `schema_migrations` row), `Tx(ctx, fn)`,
+  `CreateRun`, `Get/List{Run,Job,JobDeps,Runner,Events}`, `UpsertRunner`,
+  `AppendEvent`. Injected `Clock` (Unix ms); `Reader()` for reads outside a tx.
+- Flaky: nothing.
+- Next: C04.
+known gap: runner `state` values not pinned by blueprint — store defaults to `online`; revisit in C05.
+
 ## C02 · pipeline: parse and validate .quarry.yml, build DAG — done
 
 - Landed: `internal/pipeline` — `Parse([]byte)` (yaml.v3, unknown fields
