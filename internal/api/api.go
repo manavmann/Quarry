@@ -1,7 +1,7 @@
 // Package api is the control plane's HTTP surface. Handlers translate
 // HTTP into store calls and store rows into JSON; they hold no business
-// logic. This file covers the user endpoints (blueprint §10); the runner
-// protocol under /api/runner/* lands in C05.
+// logic. This file covers the user endpoints (blueprint §10); runner.go
+// covers the runner protocol under /api/runner/* (docs/protocol.md).
 package api
 
 import (
@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"quarry/internal/pipeline"
+	"quarry/internal/scheduler"
 	"quarry/internal/store"
 )
 
@@ -31,13 +32,16 @@ type Config struct {
 	APIToken string
 	// Logger receives one line per request; nil means log.Default().
 	Logger *log.Logger
+	// Scheduler tunes the runner protocol (lease TTL).
+	Scheduler scheduler.Config
 }
 
 // Server serves the user API over a *store.Store.
 type Server struct {
-	st  *store.Store
-	cfg Config
-	mux *http.ServeMux
+	st    *store.Store
+	sched *scheduler.Scheduler
+	cfg   Config
+	mux   *http.ServeMux
 }
 
 // New builds a Server whose routes are all registered on a fresh mux.
@@ -45,7 +49,7 @@ func New(st *store.Store, cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
-	s := &Server{st: st, cfg: cfg, mux: http.NewServeMux()}
+	s := &Server{st: st, sched: scheduler.New(st, cfg.Scheduler), cfg: cfg, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	api := http.NewServeMux()
@@ -55,6 +59,9 @@ func New(st *store.Store, cfg Config) *Server {
 	api.HandleFunc("GET /api/runs/{id}/events", s.handleListEvents)
 	api.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
 	api.HandleFunc("GET /api/runners", s.handleListRunners)
+	api.HandleFunc("POST /api/runner/claim", s.handleClaim)
+	api.HandleFunc("POST /api/runner/heartbeat", s.handleHeartbeat)
+	api.HandleFunc("POST /api/runner/jobs/{id}/complete", s.handleComplete)
 	s.mux.Handle("/api/", s.requireToken(api))
 	return s
 }

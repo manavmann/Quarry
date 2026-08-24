@@ -6,6 +6,7 @@
 //	QUARRY_LISTEN     address to bind            (default :8080)
 //	QUARRY_DB         SQLite database path       (default quarry.db)
 //	QUARRY_API_TOKEN  bearer token for /api/*    (required)
+//	QUARRY_LEASE_TTL  job lease duration          (default 30s)
 package main
 
 import (
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"quarry/internal/api"
+	"quarry/internal/scheduler"
 	"quarry/internal/store"
 	"quarry/internal/version"
 )
@@ -30,6 +32,7 @@ type config struct {
 	listen   string
 	dbPath   string
 	apiToken string
+	leaseTTL time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -37,9 +40,17 @@ func loadConfig() (config, error) {
 		listen:   envOr("QUARRY_LISTEN", ":8080"),
 		dbPath:   envOr("QUARRY_DB", "quarry.db"),
 		apiToken: os.Getenv("QUARRY_API_TOKEN"),
+		leaseTTL: scheduler.DefaultLeaseTTL,
 	}
 	if c.apiToken == "" {
 		return c, errors.New("QUARRY_API_TOKEN must be set")
+	}
+	if v := os.Getenv("QUARRY_LEASE_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return c, fmt.Errorf("QUARRY_LEASE_TTL: %q is not a positive duration", v)
+		}
+		c.leaseTTL = d
 	}
 	return c, nil
 }
@@ -79,13 +90,15 @@ func run(logger *log.Logger) error {
 	defer st.Close()
 
 	srv := &http.Server{
-		Addr:              cfg.listen,
-		Handler:           api.New(st, api.Config{APIToken: cfg.apiToken, Logger: logger}),
+		Addr: cfg.listen,
+		Handler: api.New(st, api.Config{
+			APIToken: cfg.apiToken, Logger: logger, Scheduler: scheduler.Config{LeaseTTL: cfg.leaseTTL},
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
-	logger.Printf("%s listening on %s (db %s)", version.String("server"), cfg.listen, cfg.dbPath)
+	logger.Printf("%s listening on %s (db %s, lease ttl %s)", version.String("server"), cfg.listen, cfg.dbPath, cfg.leaseTTL)
 
 	select {
 	case err := <-errc:

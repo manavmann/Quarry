@@ -9,13 +9,13 @@ const (
 	RunCancelled = "cancelled"
 )
 
-// Job states. A job is `pending` until every dependency succeeded, `ready`
+// Job states. A job is `pending` until every dependency succeeded, `queued`
 // once claimable, `running` while a runner holds its lease, and terminal
 // otherwise. `skipped` means a dependency failed or the run was cancelled
 // before the job started.
 const (
 	JobPending   = "pending"
-	JobReady     = "ready"
+	JobQueued    = "queued"
 	JobRunning   = "running"
 	JobSucceeded = "succeeded"
 	JobFailed    = "failed"

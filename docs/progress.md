@@ -2,6 +2,24 @@
 
 Read this first each session. Newest entry on top.
 
+## C05 · scheduler: atomic claim, heartbeat leases, fenced completion, DAG advancement — done
+
+- Landed: `docs/protocol.md` (runner protocol + fencing/advancement rules);
+  `internal/scheduler` — `Claim` (runner upsert, queued jobs by `queued_at`,
+  labels ⊆ in Go, guarded `state=queued` update, attempt+1, lease, `run.started`),
+  `Heartbeat` (lease extend where `running AND attempt AND runner_id`,
+  `continue`/`abort`), `Complete` (fence → terminal or infra-requeue below
+  `max_attempts` → fixpoint advancement pending→queued/skipped → run
+  finalization, all one Tx; duplicate = no-op, else `ErrFenced`). Store gained
+  guarded primitives in `jobs.go` and `_txlock=immediate` (BEGIN IMMEDIATE).
+  `internal/api`: `POST /api/runner/{claim,heartbeat,jobs/{id}/complete}`
+  (204/409/404/400). `cmd/server`: `QUARRY_LEASE_TTL` (default 30s).
+- Flaky: nothing.
+- Next: C06.
+known gap: `submitRun` still sets `max_attempts=1` (blueprint default 3), so
+infra retry is inert until that lands; `cancel` directive is reserved, no
+cancel path yet; lease expiry/lost_runner is C07.
+
 ## C04 · api: run submission, run/job/event reads, server main — done
 
 - Landed: `internal/api` — stdlib mux, bearer middleware (constant-time,
@@ -9,7 +27,7 @@ Read this first each session. Newest entry on top.
   YAML body, 400 on parse/validation, 413 over 1 MiB), `GET /api/runs?limit=`,
   `GET /api/runs/{id}` (run + jobs), `GET /api/runs/{id}/events?after=`,
   `GET /api/jobs/{id}`, `GET /api/runners`, `GET /healthz`. `submit.go` maps
-  pipeline → store rows in one Tx: roots `ready`, rest `pending`, deps,
+  pipeline → store rows in one Tx: roots `queued`, rest `pending`, deps,
   `run.created` event. `cmd/server`: `QUARRY_LISTEN`/`QUARRY_DB`/
   `QUARRY_API_TOKEN` (required), SIGINT/SIGTERM graceful shutdown.
 - Flaky: nothing.

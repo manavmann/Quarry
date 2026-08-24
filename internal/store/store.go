@@ -46,6 +46,9 @@ func Open(ctx context.Context, path string, opts ...Option) (*Store, error) {
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(ON)")
 	q.Add("_pragma", "synchronous(NORMAL)")
+	// Every Tx is a write: take the write lock up front (BEGIN IMMEDIATE)
+	// so a transaction never has to upgrade a read lock mid-way.
+	q.Set("_txlock", "immediate")
 	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)

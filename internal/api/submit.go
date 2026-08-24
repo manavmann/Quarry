@@ -16,7 +16,7 @@ const TriggerAPI = "api"
 // submitRun turns a validated pipeline into store rows and commits them in
 // one transaction: the run (pending), one job per pipeline job, the
 // dependency edges, and a run.created event. Root jobs are inserted as
-// ready so a runner can claim them immediately; every other job waits as
+// queued so a runner can claim them immediately; every other job waits as
 // pending until the scheduler (C05) advances the DAG.
 //
 // This is deliberately not an HTTP handler: it is the only piece of
@@ -45,7 +45,7 @@ func submitRun(ctx context.Context, st *store.Store, p *pipeline.Pipeline, src s
 		ids[pj.Name] = id
 		state := store.JobPending
 		if roots[pj.Name] {
-			state = store.JobReady
+			state = store.JobQueued
 		}
 		jobs = append(jobs, store.Job{ID: id, Name: pj.Name, SpecJSON: spec, State: state, MaxAttempts: 1})
 	}

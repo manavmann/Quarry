@@ -97,8 +97,8 @@ func TestSubmitValidQueuesRoots(t *testing.T) {
 		t.Fatalf("jobs = %d, want 4", len(got.Jobs))
 	}
 
-	// Roots (build, lint) are ready; test and deploy wait on their needs.
-	want := map[string]string{"build": store.JobReady, "lint": store.JobReady,
+	// Roots (build, lint) are queued; test and deploy wait on their needs.
+	want := map[string]string{"build": store.JobQueued, "lint": store.JobQueued,
 		"test": store.JobPending, "deploy": store.JobPending}
 	jobs, err := st.ListJobs(context.Background(), st.Reader(), got.Run.ID)
 	if err != nil {
@@ -277,5 +277,147 @@ func TestRequestIDIsHonoured(t *testing.T) {
 	resp := do(t, srv, http.MethodGet, "/api/runs", "", nil, "X-Request-ID", "abc-123")
 	if got := resp.Header.Get("X-Request-ID"); got != "abc-123" {
 		t.Errorf("X-Request-ID = %q, want abc-123", got)
+	}
+}
+
+// ---- runner protocol -----------------------------------------------------
+
+type claimedJSON struct {
+	Job *struct {
+		jobJSON
+		LeaseTTLMillis int64 `json:"lease_ttl_ms"`
+	} `json:"job"`
+}
+
+func TestRunnerClaimHeartbeatComplete(t *testing.T) {
+	srv, _ := newTestServer(t)
+	var created runDetailJSON
+	do(t, srv, "POST", "/api/runs", validYAML, &created)
+
+	// build and lint are roots → two claims succeed, the third is 204.
+	// Every claim carries the full registration, as a real runner does.
+	const claimBody = `{"runner_id":"r1","name":"one","labels":{"os":"linux"},"capacity":2}`
+	var first, second claimedJSON
+	if resp := do(t, srv, "POST", "/api/runner/claim", claimBody, &first); resp.StatusCode != http.StatusOK {
+		t.Fatalf("claim 1: %d", resp.StatusCode)
+	}
+	if first.Job == nil || first.Job.Attempt != 1 || first.Job.State != store.JobRunning || first.Job.LeaseTTLMillis != 30_000 {
+		t.Fatalf("claim 1 body = %+v", first.Job)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/claim", claimBody, &second); resp.StatusCode != http.StatusOK {
+		t.Fatalf("claim 2: %d", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/claim", claimBody, nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("claim 3: %d, want 204", resp.StatusCode)
+	}
+	var runners struct {
+		Runners []runnerJSON `json:"runners"`
+	}
+	do(t, srv, "GET", "/api/runners", "", &runners)
+	if len(runners.Runners) != 1 || runners.Runners[0].Name != "one" || runners.Runners[0].Capacity != 2 {
+		t.Fatalf("runners = %+v", runners.Runners)
+	}
+
+	// Heartbeat: live attempt continues, stale attempt aborts.
+	var hb struct {
+		Jobs []directiveJSON `json:"jobs"`
+	}
+	body := `{"runner_id":"r1","jobs":[{"job_id":"` + first.Job.ID + `","attempt":1},{"job_id":"` + second.Job.ID + `","attempt":7}]}`
+	if resp := do(t, srv, "POST", "/api/runner/heartbeat", body, &hb); resp.StatusCode != http.StatusOK {
+		t.Fatalf("heartbeat: %d", resp.StatusCode)
+	}
+	if len(hb.Jobs) != 2 || hb.Jobs[0].Directive != "continue" || hb.Jobs[1].Directive != "abort" {
+		t.Fatalf("directives = %+v", hb.Jobs)
+	}
+
+	// Complete build → test becomes queued; a stale attempt is 409;
+	// a duplicate is 200 and changes nothing.
+	build, lint := first.Job, second.Job
+	if build.Name != "build" {
+		build, lint = lint, build
+	}
+	var done jobJSON
+	if resp := do(t, srv, "POST", "/api/runner/jobs/"+build.ID+"/complete",
+		`{"runner_id":"r1","attempt":1,"status":"succeeded","exit_code":0}`, &done); resp.StatusCode != http.StatusOK {
+		t.Fatalf("complete: %d", resp.StatusCode)
+	}
+	if done.State != store.JobSucceeded {
+		t.Fatalf("complete body = %+v", done)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/jobs/"+build.ID+"/complete",
+		`{"runner_id":"r1","attempt":1,"status":"failed","failure_kind":"exit_code","exit_code":1}`, &done); resp.StatusCode != http.StatusOK || done.State != store.JobSucceeded {
+		t.Fatalf("duplicate complete: %d %+v", resp.StatusCode, done)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/jobs/"+build.ID+"/complete",
+		`{"runner_id":"r1","attempt":2,"status":"succeeded"}`, nil); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("stale attempt: %d, want 409", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/jobs/nope/complete",
+		`{"runner_id":"r1","attempt":1,"status":"succeeded"}`, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown job: %d, want 404", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/jobs/"+lint.ID+"/complete",
+		`{"runner_id":"r1","attempt":1,"status":"failed"}`, nil); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("failed without kind: %d, want 400", resp.StatusCode)
+	}
+
+	var detail runDetailJSON
+	do(t, srv, "GET", "/api/runs/"+created.Run.ID, "", &detail)
+	states := map[string]string{}
+	for _, j := range detail.Jobs {
+		states[j.Name] = j.State
+	}
+	if states["build"] != store.JobSucceeded || states["test"] != store.JobQueued || states["deploy"] != store.JobPending || states["lint"] != store.JobRunning {
+		t.Fatalf("states = %v", states)
+	}
+	if detail.Run.State != store.RunRunning {
+		t.Fatalf("run state = %s", detail.Run.State)
+	}
+
+	// Finish the rest: lint fails → run fails once test and deploy settle.
+	do(t, srv, "POST", "/api/runner/jobs/"+lint.ID+"/complete",
+		`{"runner_id":"r1","attempt":1,"status":"failed","failure_kind":"exit_code","exit_code":3}`, nil)
+	var testJob claimedJSON
+	do(t, srv, "POST", "/api/runner/claim", claimBody, &testJob)
+	if testJob.Job == nil || testJob.Job.Name != "test" {
+		t.Fatalf("expected to claim test, got %+v", testJob.Job)
+	}
+	do(t, srv, "POST", "/api/runner/jobs/"+testJob.Job.ID+"/complete",
+		`{"runner_id":"r1","attempt":1,"status":"succeeded"}`, nil)
+	var deploy claimedJSON
+	do(t, srv, "POST", "/api/runner/claim", claimBody, &deploy)
+	do(t, srv, "POST", "/api/runner/jobs/"+deploy.Job.ID+"/complete",
+		`{"runner_id":"r1","attempt":1,"status":"succeeded"}`, nil)
+	do(t, srv, "GET", "/api/runs/"+created.Run.ID, "", &detail)
+	if detail.Run.State != store.RunFailed || detail.Run.FinishedAt == 0 {
+		t.Fatalf("final run = %+v", detail.Run)
+	}
+}
+
+func TestRunnerEndpointsValidateInput(t *testing.T) {
+	srv, _ := newTestServer(t)
+	for _, tc := range []struct {
+		path, body string
+		want       int
+	}{
+		{"/api/runner/claim", `{}`, http.StatusBadRequest},
+		{"/api/runner/claim", `not json`, http.StatusBadRequest},
+		{"/api/runner/heartbeat", `{"jobs":[]}`, http.StatusBadRequest},
+		{"/api/runner/jobs/x/complete", `{"runner_id":"r1","attempt":0,"status":"succeeded"}`, http.StatusBadRequest},
+		{"/api/runner/claim", `{"runner_id":"` + strings.Repeat("x", MaxRunnerBodyBytes) + `"}`, http.StatusRequestEntityTooLarge},
+	} {
+		if resp := do(t, srv, "POST", tc.path, tc.body, nil); resp.StatusCode != tc.want {
+			t.Errorf("POST %s %.40q: %d, want %d", tc.path, tc.body, resp.StatusCode, tc.want)
+		}
+	}
+	// Runner endpoints sit behind the same bearer check.
+	req, _ := http.NewRequest("POST", srv.URL+"/api/runner/claim", strings.NewReader(`{"runner_id":"r1"}`))
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: %d, want 401", resp.StatusCode)
 	}
 }
