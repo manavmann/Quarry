@@ -2,6 +2,21 @@
 
 Read this first each session. Newest entry on top.
 
+## C04 · api: run submission, run/job/event reads, server main — done
+
+- Landed: `internal/api` — stdlib mux, bearer middleware (constant-time,
+  401 on `/api/*`), `X-Request-ID` middleware, `POST /api/runs` (raw inline
+  YAML body, 400 on parse/validation, 413 over 1 MiB), `GET /api/runs?limit=`,
+  `GET /api/runs/{id}` (run + jobs), `GET /api/runs/{id}/events?after=`,
+  `GET /api/jobs/{id}`, `GET /api/runners`, `GET /healthz`. `submit.go` maps
+  pipeline → store rows in one Tx: roots `ready`, rest `pending`, deps,
+  `run.created` event. `cmd/server`: `QUARRY_LISTEN`/`QUARRY_DB`/
+  `QUARRY_API_TOKEN` (required), SIGINT/SIGTERM graceful shutdown.
+- Flaky: nothing.
+- Next: C05.
+known gap: `cancel`, `source`, `logs`, `artifacts`, `/metrics` deferred to
+C05/C08/C10 (need scheduler transitions or tables that don't exist yet).
+
 ## C03 · store: SQLite schema, migrations, runs/jobs/runners/events — done
 
 - Landed: `internal/store` over `modernc.org/sqlite` — single-conn pool,
