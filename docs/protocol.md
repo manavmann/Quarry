@@ -23,14 +23,31 @@ is the n-th runner to hold the job. A job is terminal in `succeeded`,
 All `/api/runner/*` endpoints take the same bearer token as the user API.
 Bodies are JSON. Timestamps are Unix milliseconds.
 
+### `POST /api/runner/register`
+
+```json
+{"name": "box-a", "labels": {"os": "linux"}, "capacity": 2}
+```
+
+Resolves a runner name to its `runner_id`, minting one on first sight.
+Names are unique (`runners.name`, migration 0002); re-registering the
+same name is idempotent — the reply carries the same `runner_id` and the
+row's labels and capacity are refreshed (version comes from claim). The lookup and upsert
+share one transaction. A runner calls this once at startup, before its
+first claim, and retries transport/5xx failures with backoff (a control
+plane that is still starting just delays it); a 4xx is fatal.
+
+Responses: `200 {"runner_id": "…"}`, `400` when `name` is empty or
+`capacity` is negative.
+
 ### `POST /api/runner/claim`
 
 ```json
 {"runner_id": "r1", "name": "r1", "labels": {"os": "linux"}, "capacity": 2, "version": "dev"}
 ```
 
-Registers or refreshes the runner (labels, capacity, version,
-`last_seen_at`), then, in one `BEGIN IMMEDIATE` transaction:
+Refreshes the runner row (labels, capacity, version, `last_seen_at`),
+then, in one `BEGIN IMMEDIATE` transaction:
 
 1. select `queued` jobs ordered by `queued_at, rowid`;
 2. pick the first whose spec labels ⊆ runner labels (matched in Go);
@@ -70,7 +87,7 @@ Reply carries one directive per job:
 | `abort`    | the fence failed — the job is unknown, not running, or the       |
 |            | attempt is not yours any more. Kill the container, report nothing |
 
-An unknown runner is registered as a side effect (name = id, no labels).
+An unknown runner is upserted as a side effect (name = id, no labels).
 
 ### `POST /api/runner/jobs/{id}/complete`
 

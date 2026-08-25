@@ -2,6 +2,40 @@
 
 Read this first each session. Newest entry on top.
 
+## C06 · agent: runner loop, executor interface, fake executor, in-process harness — done
+
+- Landed: `internal/executor` — one-method `Executor` (`Run(ctx, JobSpec,
+  io.Writer) (Result, error)`; nil error + exit code = ran, error = infra,
+  kill via ctx), `FakeExecutor` scripted per job name (exit code, infra
+  error, delay, hang-until-`Release`, log bytes) with an `Executions()`
+  record. `internal/agent` — HTTP-only client with its own wire types
+  (runner binary never links store/api), `POST /api/runner/register`
+  called once at startup before any claim (name → server-assigned
+  `runner_id`, idempotent per name via unique `runners.name` in migration
+  0002; transport/5xx retried with backoff, 4xx fatal), poll loop with
+  ±25% jitter and a capacity semaphore (a full runner does not poll), one
+  goroutine per (job,attempt), heartbeat goroutine
+  honouring `abort` (kill, report nothing) and `cancel` (kill, report
+  `cancelled`), per-job timeout → `timeout`, executor error → `infra`,
+  complete with exponential retry on transport/5xx (409/4xx final), SIGTERM
+  drain kills attempts and reports `infra("runner shutting down")`.
+  `cmd/runner` env wiring (`QUARRY_SERVER`/`API_TOKEN`/`RUNNER_NAME`/`LABELS`/
+  `CAPACITY`/`POLL_INTERVAL`/`HEARTBEAT_INTERVAL`/`EXECUTOR=fake`).
+  `internal/harness` — `New(t, Opts)` (server on temp DB + httptest port,
+  fake `Clock` injected into the store, N agents each with a FakeExecutor),
+  `Client()`, `Submit`, `WaitRun`, `WaitJob`, `Events`, `EventTypes`,
+  `Script`/`Release`/`Executions`, `Kill`/`Restart`, `AgentID` (assigned
+  id), `WaitFor` deadline polling; teardown in `t.Cleanup`. Tests: diamond
+  across 3 agents, each job once under 5-agent contention, failing job
+  skips dependents, infra failure, label routing, kill/restart keeps the
+  same `runner_id`; harness suite ~2.5 s. `internal/api` gained
+  `handleRegister` + test; `internal/store` gained `GetRunnerByName`.
+- Flaky: nothing (agent+harness 5× under `-race` clean).
+- Next: C07.
+known gap: logs go to `io.Discard` until C08; lease TTL is wired but never
+expires (fake clock, no monitor) until C07; a killed runner reports `infra`
+which is terminal while `max_attempts=1`.
+
 ## C05 · scheduler: atomic claim, heartbeat leases, fenced completion, DAG advancement — done
 
 - Landed: `docs/protocol.md` (runner protocol + fencing/advancement rules);

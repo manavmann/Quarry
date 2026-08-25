@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,9 +11,10 @@ import (
 	"quarry/internal/store"
 )
 
-// Runner protocol (docs/protocol.md): /api/runner/claim, /heartbeat and
-// /jobs/{id}/complete. Handlers decode, call the scheduler, encode; the
-// fencing and advancement rules live in internal/scheduler.
+// Runner protocol (docs/protocol.md): /api/runner/register, /claim,
+// /heartbeat and /jobs/{id}/complete. Handlers decode, call the store or
+// scheduler, encode; the fencing and advancement rules live in
+// internal/scheduler.
 
 // MaxRunnerBodyBytes bounds a runner request body.
 const MaxRunnerBodyBytes = 64 << 10
@@ -159,4 +161,49 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 func isBadResult(err error) bool {
 	var e *scheduler.InvalidResultError
 	return errors.As(err, &e)
+}
+
+type registerRequest struct {
+	Name     string            `json:"name"`
+	Labels   map[string]string `json:"labels"`
+	Capacity int               `json:"capacity"`
+}
+
+// handleRegister resolves a runner name to its runner_id, minting one on
+// first sight. Re-registering the same name is idempotent: the id is
+// reused and labels and capacity are refreshed; version is not part of
+// the body (claim reports it), so an existing row keeps its value. The lookup and
+// the upsert share one transaction, and runners.name is unique, so two
+// concurrent first registrations of one name cannot both mint an id.
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req registerRequest
+	if !s.decodeRunnerBody(w, r, &req) {
+		return
+	}
+	if req.Name == "" {
+		writeError(w, r, http.StatusBadRequest, "name is required")
+		return
+	}
+	if req.Capacity < 0 {
+		writeError(w, r, http.StatusBadRequest, "capacity must not be negative")
+		return
+	}
+	runner := &store.Runner{Name: req.Name, Labels: req.Labels, Capacity: req.Capacity}
+	err := s.st.Tx(r.Context(), func(tx *sql.Tx) error {
+		existing, err := s.st.GetRunnerByName(r.Context(), tx, req.Name)
+		switch {
+		case err == nil:
+			runner.ID, runner.Version = existing.ID, existing.Version
+		case errors.Is(err, store.ErrNotFound):
+			runner.ID = newID(8)
+		default:
+			return err
+		}
+		return s.st.UpsertRunner(r.Context(), tx, runner)
+	})
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"runner_id": runner.ID})
 }

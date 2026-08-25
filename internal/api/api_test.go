@@ -421,3 +421,54 @@ func TestRunnerEndpointsValidateInput(t *testing.T) {
 		t.Fatalf("no token: %d, want 401", resp.StatusCode)
 	}
 }
+
+func TestRunnerRegisterIsIdempotentByName(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	var first, again, other struct {
+		RunnerID string `json:"runner_id"`
+	}
+	if resp := do(t, srv, "POST", "/api/runner/register",
+		`{"name":"box-a","labels":{"os":"linux"},"capacity":2}`, &first); resp.StatusCode != http.StatusOK || first.RunnerID == "" {
+		t.Fatalf("register: status=%d body=%+v", resp.StatusCode, first)
+	}
+	// Same name → same id; labels and capacity are refreshed.
+	if resp := do(t, srv, "POST", "/api/runner/register",
+		`{"name":"box-a","labels":{"os":"linux","gpu":"true"},"capacity":4}`, &again); resp.StatusCode != http.StatusOK {
+		t.Fatalf("re-register: status=%d", resp.StatusCode)
+	}
+	if again.RunnerID != first.RunnerID {
+		t.Fatalf("re-register minted a new id: %s -> %s", first.RunnerID, again.RunnerID)
+	}
+	// A different name gets a different id.
+	do(t, srv, "POST", "/api/runner/register", `{"name":"box-b","capacity":1}`, &other)
+	if other.RunnerID == "" || other.RunnerID == first.RunnerID {
+		t.Fatalf("box-b id = %q (box-a %q)", other.RunnerID, first.RunnerID)
+	}
+
+	var runners struct {
+		Runners []runnerJSON `json:"runners"`
+	}
+	do(t, srv, "GET", "/api/runners", "", &runners)
+	if len(runners.Runners) != 2 {
+		t.Fatalf("runners = %+v", runners.Runners)
+	}
+	byName := map[string]runnerJSON{}
+	for _, r := range runners.Runners {
+		byName[r.Name] = r
+	}
+	a := byName["box-a"]
+	if a.ID != first.RunnerID || a.Capacity != 4 || a.Labels["gpu"] != "true" {
+		t.Fatalf("box-a after re-register = %+v", a)
+	}
+	if b := byName["box-b"]; b.ID != other.RunnerID || b.Capacity != 1 {
+		t.Fatalf("box-b = %+v", b)
+	}
+
+	if resp := do(t, srv, "POST", "/api/runner/register", `{"labels":{}}`, nil); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("register without name: status=%d, want 400", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/register", `{"name":"x","capacity":-1}`, nil); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("register with negative capacity: status=%d, want 400", resp.StatusCode)
+	}
+}

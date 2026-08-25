@@ -91,3 +91,17 @@ func (s *Store) ListRunners(ctx context.Context, q Querier) ([]Runner, error) {
 	}
 	return out, rows.Err()
 }
+
+// GetRunnerByName returns the runner registered under name or ErrNotFound.
+// Names are unique (migration 0002), so this is how register resolves a
+// name to its runner_id.
+func (s *Store) GetRunnerByName(ctx context.Context, q Querier, name string) (*Runner, error) {
+	r, err := scanRunner(q.QueryRowContext(ctx, `SELECT `+runnerCols+` FROM runners WHERE name = ?`, name))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get runner by name %q: %w", name, err)
+	}
+	return r, nil
+}
