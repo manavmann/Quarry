@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -552,5 +554,48 @@ func TestRunnerLogsIngestAndCursorRead(t *testing.T) {
 	do(t, srv, "GET", "/api/jobs/"+job.ID+"/logs", "", &got)
 	if got.Next != 3 {
 		t.Errorf("log grew after complete: %+v", got)
+	}
+}
+
+// TestSubmitMultipart covers the CLI's submit shape: the pipeline as the
+// "pipeline" part and the workspace bundle as "source", which is drained
+// until C10 stores it. A multipart body without a pipeline part is 400.
+func TestSubmitMultipart(t *testing.T) {
+	srv, _ := newTestServer(t)
+
+	post := func(t *testing.T, parts map[string]string, out any) *http.Response {
+		t.Helper()
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		for name, body := range parts {
+			fw, err := mw.CreateFormFile(name, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(fw, body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return do(t, srv, http.MethodPost, "/api/runs", buf.String(), out, "Content-Type", mw.FormDataContentType())
+	}
+
+	var got runDetailJSON
+	resp := post(t, map[string]string{"pipeline": validYAML, "source": strings.Repeat("x", 4096)}, &got)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	if got.Run.ID == "" || len(got.Jobs) != 4 {
+		t.Fatalf("run = %+v jobs = %d", got.Run, len(got.Jobs))
+	}
+
+	var e struct {
+		Error string `json:"error"`
+	}
+	resp = post(t, map[string]string{"source": "x"}, &e)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(e.Error, "pipeline") {
+		t.Fatalf("status = %d err = %q, want 400 naming the pipeline part", resp.StatusCode, e.Error)
 	}
 }

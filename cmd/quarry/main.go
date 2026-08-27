@@ -1,12 +1,13 @@
-// Command quarry is a Quarry binary stub; it prints its version and exits.
+// Command quarry is the Quarry CLI: submit, watch and inspect runs against
+// a control plane. See internal/cli for the commands and configuration.
 package main
 
 import (
-	"fmt"
+	"os"
 
-	"quarry/internal/version"
+	"quarry/internal/cli"
 )
 
 func main() {
-	fmt.Println(version.String("quarry"))
+	os.Exit(cli.Main())
 }

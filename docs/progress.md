@@ -2,6 +2,42 @@
 
 Read this first each session. Newest entry on top.
 
+## C09 · cli: quarry run/runs/status/watch/logs/cancel/runners/events — done
+
+- Landed: `internal/cli` (cobra, approved stack; `go.mod` gains
+  `spf13/cobra` + indirect `pflag`, `mousetrap`) and `cmd/quarry` calling
+  `cli.Main()`. `client.go`: own wire types (never links `api`/`store`),
+  bearer auth, capped exponential retry on transport errors and
+  502/503/504 (5 retries from 200 ms), `APIError` with request id.
+  `bundle.go`: `Bundle(w, dir)` tars the workspace with slash-relative
+  names in lexical order, skips any `.git` entry at any depth, records
+  symlinks as symlink entries (never followed). `render.go`: `dagOrder`
+  (Kahn over `spec.needs`, declaration tie-break — same walk as
+  `pipeline.TopoOrder`, which can't be reused on spec JSON), `renderJobs`
+  (JOB/STATE/ATTEMPT/RUNNER/DURATION, `failed (exit N|kind)`, `a/max`
+  when max>1), runs/runners/events tables; durations from an injected
+  Unix-ms `now`. Commands: `run` (bundle → temp tar → multipart
+  `pipeline`+`source` streamed per attempt, `--wait`, `-C`, `-f`), `runs
+  -n`, `status`, `watch` (redraws only on change, exit 1 unless
+  succeeded), `logs [-f] [--attempt]` (job state read *before* chunks;
+  exits when terminal and a read returns nothing), `events [-f]`,
+  `runners`, `cancel`. `QUARRY_SERVER`/`QUARRY_TOKEN`, `--interval`.
+  `internal/api.handleSubmitRun` now also accepts `multipart/form-data`
+  (`pipeline` part parsed, `source` drained and discarded, body bounded by
+  `MaxPipelineBytes+MaxSourceBytes` (256 MiB)); raw-YAML path unchanged.
+  Tests: bundle excludes `.git` (root and nested, `.gitignore` kept),
+  symlinks not followed (skips on Windows without the privilege),
+  deterministic bytes; job/runs/runners/events table snapshots; DAG
+  tie-break; api multipart submit (201, 400 without pipeline part).
+  Verified manually against a local server + fake runner: run --wait,
+  runs, status, watch, logs -f, events, runners, retry exhaustion, 404s.
+- Flaky: nothing.
+- Next: C10.
+known gap: `quarry cancel` posts `/api/runs/{id}/cancel`, which is not served
+yet (404) — the server cancel path still doesn't exist; `artifacts` is not
+in this entry; the uploaded bundle is discarded until C10 stores/serves it;
+the RUNNER column shows the runner id, not its name (one call per tick).
+
 ## C08 · logs: attempt-fenced chunk ingest, cursor reads, runner log shipper — done
 
 - Landed: migration `0003_log_chunks` (`PRIMARY KEY (job_id, attempt,

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,8 +24,11 @@ import (
 	"quarry/internal/store"
 )
 
-// MaxPipelineBytes bounds an inline POST /api/runs body; larger bodies get 413.
+// MaxPipelineBytes bounds a .quarry.yml document; larger ones get 413.
 const MaxPipelineBytes = 1 << 20
+
+// MaxSourceBytes bounds the workspace bundle of a multipart POST /api/runs.
+const MaxSourceBytes = 256 << 20
 
 // Config is everything the API needs from its caller.
 type Config struct {
@@ -119,10 +123,18 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleSubmitRun accepts a .quarry.yml document as the raw request body.
-// C10 replaces this with a multipart upload carrying the source tar.
+// handleSubmitRun accepts a .quarry.yml document either as the raw request
+// body or as the "pipeline" part of a multipart/form-data upload whose
+// "source" part is the CLI's workspace bundle. The bundle is drained and
+// discarded until C10 stores it and serves it to runners.
 func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
-	src, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxPipelineBytes))
+	var src []byte
+	var err error
+	if ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); ct == "multipart/form-data" {
+		src, err = readMultipartPipeline(w, r)
+	} else {
+		src, err = io.ReadAll(http.MaxBytesReader(w, r.Body, MaxPipelineBytes))
+	}
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -143,6 +155,45 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, runDetail(run, jobs))
+}
+
+// readMultipartPipeline returns the "pipeline" part of a multipart submit.
+// The "source" part is drained; any other part is an error. The whole body
+// is bounded by MaxPipelineBytes + MaxSourceBytes.
+func readMultipartPipeline(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, MaxPipelineBytes+MaxSourceBytes)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return nil, err
+	}
+	var src []byte
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch part.FormName() {
+		case "pipeline":
+			src, err = io.ReadAll(io.LimitReader(part, MaxPipelineBytes+1))
+			if err == nil && len(src) > MaxPipelineBytes {
+				err = &http.MaxBytesError{Limit: MaxPipelineBytes}
+			}
+		case "source":
+			_, err = io.Copy(io.Discard, part)
+		default:
+			err = fmt.Errorf("unexpected multipart field %q", part.FormName())
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if src == nil {
+		return nil, errors.New(`multipart body has no "pipeline" part`)
+	}
+	return src, nil
 }
 
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
