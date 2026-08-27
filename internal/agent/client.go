@@ -214,3 +214,37 @@ func (c *client) completeWithRetry(ctx context.Context, jobID string, req comple
 	}
 	return fmt.Errorf("complete job %s: giving up after %d tries: %w", jobID, attempts, err)
 }
+
+// SourceFetcher returns a function that streams a run's source bundle
+// from GET /api/runs/{id}/source as a tar, for the Docker executor. Until
+// the server serves bundles (C10) the endpoint does not exist; a 404 is
+// reported as "no bundle" (nil, nil) so jobs run in an empty workspace.
+func SourceFetcher(cfg Config) func(ctx context.Context, runID string) (io.ReadCloser, error) {
+	// Bundles can be large: no client timeout, the job context bounds it.
+	c := &client{base: cfg.ServerURL, token: cfg.Token, http: &http.Client{}}
+	return c.source
+}
+
+// source is one GET of the run's bundle. The caller closes the body.
+func (c *client) source(ctx context.Context, runID string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/runs/"+runID+"/source", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return resp.Body, nil
+	case resp.StatusCode == http.StatusNotFound:
+		resp.Body.Close()
+		return nil, nil
+	default:
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, &statusError{Code: resp.StatusCode, Body: string(bytes.TrimSpace(raw))}
+	}
+}

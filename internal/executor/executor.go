@@ -21,11 +21,14 @@ type JobSpec struct {
 	Job     pipeline.Job
 }
 
-// Result is how a finished job ended. Exactly one of the three failure
-// kinds applies when ExitCode != 0; the runner maps it to the protocol's
-// failure_kind.
+// Result is how a finished job ended. A non-zero ExitCode is the
+// protocol's exit_code failure; timeout and cancelled come from the
+// context, infra from a non-nil error, never from Result.
 type Result struct {
 	ExitCode int
+	// OOMKilled is set when the platform killed the job for exceeding
+	// its memory limit; ExitCode is then the kill's (137).
+	OOMKilled bool
 	// Duration is wall time from container start to exit.
 	Duration time.Duration
 }

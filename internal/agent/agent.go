@@ -305,8 +305,11 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 			req = completeRequest{Status: statusSucceeded}
 		} else {
 			code := res.ExitCode
-			req = completeRequest{Status: statusFailed, FailureKind: kindExitCode, ExitCode: &code,
-				Error: fmt.Sprintf("exit code %d", code)}
+			msg := fmt.Sprintf("exit code %d", code)
+			if res.OOMKilled {
+				msg += " (out of memory)"
+			}
+			req = completeRequest{Status: statusFailed, FailureKind: kindExitCode, ExitCode: &code, Error: msg}
 		}
 	case errors.Is(cause, errAbort):
 		logger.Printf("job %s attempt %d: aborted by server, result discarded", job.ID, job.Attempt)

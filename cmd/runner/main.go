@@ -13,7 +13,8 @@
 //	QUARRY_CAPACITY            concurrent jobs             (default 2)
 //	QUARRY_POLL_INTERVAL       claim interval when idle    (default 1s)
 //	QUARRY_HEARTBEAT_INTERVAL  lease refresh interval      (default 5s)
-//	QUARRY_EXECUTOR            fake                        (default fake; docker lands with C09)
+//	QUARRY_EXECUTOR            fake | docker              (default fake)
+//	QUARRY_KEEP_FAILED         1 keeps failed containers   (default unset; docker only)
 package main
 
 import (
@@ -30,12 +31,14 @@ import (
 
 	"quarry/internal/agent"
 	"quarry/internal/executor"
+	"quarry/internal/executor/docker"
 	"quarry/internal/version"
 )
 
 type config struct {
-	agent    agent.Config
-	executor string
+	agent      agent.Config
+	executor   string
+	keepFailed bool
 }
 
 func loadConfig() (config, error) {
@@ -48,6 +51,7 @@ func loadConfig() (config, error) {
 		Version:   version.Version,
 	}
 	c.executor = envOr("QUARRY_EXECUTOR", "fake")
+	c.keepFailed = os.Getenv("QUARRY_KEEP_FAILED") == "1"
 	if c.agent.ServerURL == "" || c.agent.Token == "" {
 		return c, errors.New("QUARRY_SERVER and QUARRY_API_TOKEN must be set")
 	}
@@ -120,12 +124,18 @@ func parseLabels(s string) (map[string]string, error) {
 	return out, nil
 }
 
-func newExecutor(kind string) (executor.Executor, error) {
-	switch kind {
+func newExecutor(cfg config) (executor.Executor, error) {
+	switch cfg.executor {
 	case "fake":
 		return executor.NewFake(), nil
+	case "docker":
+		return docker.New(docker.Config{
+			RunnerName: cfg.agent.Name,
+			Source:     agent.SourceFetcher(cfg.agent),
+			KeepFailed: cfg.keepFailed,
+		})
 	default:
-		return nil, fmt.Errorf("QUARRY_EXECUTOR: unknown executor %q", kind)
+		return nil, fmt.Errorf("QUARRY_EXECUTOR: unknown executor %q", cfg.executor)
 	}
 }
 
@@ -148,7 +158,7 @@ func run(logger *log.Logger) error {
 	if err != nil {
 		return err
 	}
-	exec, err := newExecutor(cfg.executor)
+	exec, err := newExecutor(cfg)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,45 @@
 
 Read this first each session. Newest entry on top.
 
+## C07 · executor/docker: volume-per-attempt job execution with source injection — done
+
+- Landed: `internal/executor/docker` — `New(Config{RunnerName, Source,
+  KeepFailed})`, `Run` per blueprint §11: inspect → pull-if-missing (stream
+  drained, only milestone lines to the log as `[quarry] …`), named volume
+  `quarry-<job>-<attempt>` at `/workspace`, container of the same name
+  (`WorkingDir=/workspace`, env = job env + `CI=true QUARRY_JOB QUARRY_RUN
+  QUARRY_ATTEMPT` which win on clash, `--memory`/`--cpus` from
+  `resources`, labels `quarry.runner/job/run/attempt` for C16's reaper, no
+  socket/privileges), source tar `CopyToContainer` into `/workspace`, then a
+  generated `/quarry/run.sh` (`set -e`, `echo '+ <step>'` before each step,
+  single-quote escaped) copied as its own tar to `/`; attach (`Tty=false`)
+  **before** start, `stdcopy` demux into the writer; `ContainerWait` with
+  `WaitConditionNextExit` registered before start on a detached context
+  (`NotRunning` fires at once on a created container — found in test);
+  ctx cancel → `ContainerKill` + bounded wait → `ctx.Err()` (also on
+  pre-start failures once ctx is done); `Result{ExitCode, OOMKilled,
+  Duration}`; container then volume removed in defers on a detached 30 s
+  context, skipped for failed attempts when `KeepFailed`.
+  `executor.Result` gained `OOMKilled` (agent appends "(out of memory)" to
+  the exit-code error). `agent.SourceFetcher(cfg)` does `GET
+  /api/runs/{id}/source` for the executor; **404 → empty workspace** until
+  C10 serves bundles (endpoint not added: `internal/api` untouched).
+  `cmd/runner`: `QUARRY_EXECUTOR=docker`, `QUARRY_KEEP_FAILED=1`.
+  `github.com/docker/docker v28.5.2` added (approved stack). Tests behind
+  `//go:build docker` (`make test-docker`, alpine:3.20): echo job incl.
+  env + first-line capture + stderr, non-zero exit + `set -e`, timeout
+  kill, source visible in `/workspace`, step with quotes, cleanup on
+  success/failure/kill/pull-error + `KeepFailed`; untagged unit tests for
+  `runScript`/`env`/`parseMemory`/`hostConfig`. Docker suite ~12 s, 3×
+  under `-race` clean.
+- Flaky: nothing. stdout/stderr order across the two pipes is not fixed;
+  tests only assert order within stdout.
+- Next: C08.
+known gap: no `/api/runs/{id}/source` endpoint yet (C10); the lease
+monitor / `lost_runner` expiry mentioned in C06's gap is still open (it was
+never part of this entry); OOM has no dedicated `failure_kind`, it is an
+`exit_code` failure with `OOMKilled` in the executor result.
+
 ## C06 · agent: runner loop, executor interface, fake executor, in-process harness — done
 
 - Landed: `internal/executor` — one-method `Executor` (`Run(ctx, JobSpec,
