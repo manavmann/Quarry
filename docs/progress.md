@@ -2,6 +2,48 @@
 
 Read this first each session. Newest entry on top.
 
+## C08 · logs: attempt-fenced chunk ingest, cursor reads, runner log shipper — done
+
+- Landed: migration `0003_log_chunks` (`PRIMARY KEY (job_id, attempt,
+  seq)`, `data BLOB`); `store/logs.go` (`InsertLogChunk` via `INSERT OR
+  IGNORE` → inserted bool, `LogBytes`, `ListLogChunks seq > ?`) and
+  `HasJobEvent`. `scheduler.AppendLogs` fences on
+  `(running, attempt)` in one Tx (stale/finished → `ErrFenced`, unknown →
+  `ErrNotFound`, `seq < 1` → `InvalidResultError`, whose message is now
+  "invalid request"), applies `Config.LogCapBytes` (default 10 MiB,
+  `QUARRY_LOG_CAP`): the crossing chunk is cut, later chunks stored empty
+  so redelivery still dedups, `job.logs_truncated {attempt, cap_bytes}`
+  recorded exactly once (`HasJobEvent` covers the exact-fit edge).
+  `api/logs.go`: `POST /api/runner/jobs/{id}/logs` (1 MiB body, base64
+  `data`, 204/409/404/400) and `GET /api/jobs/{id}/logs?after=&attempt=`
+  → `{attempt, chunks, next}` with strictly-greater-than cursor; `next` =
+  last seq returned, else the `after` asked for. `internal/logship`: an
+  `io.Writer` shipper — 250 ms / 64 KiB flush, seq assigned once at seal
+  (retries resend the identical batch), capped exponential backoff,
+  `Sink` contract (`ErrStale` = 409 → buffer dropped + `OnStale` once;
+  `ErrRejected` = other 4xx → dropped, reported by `Close`), 512 KiB per
+  POST, 16 MiB buffer cap with a `[quarry] log shipper dropped N bytes`
+  marker, `Close(ctx)` flushes synchronously (done ctx = discard). Agent:
+  one shipper per attempt is the executor's writer; `OnStale` cancels the
+  attempt with `errAbort`; the verdict (`context.Cause`) is snapshotted
+  right after `Run` returns, then the shipper is closed under
+  `LogFlushTimeout` (30 s) **before** `complete` — a 409 met by the final
+  flush never becomes an abort (A4 bug 1); `Config.LogFlush{Interval,
+  Bytes,Timeout}`. `docs/protocol.md` documents both endpoints.
+  Tests: store dedup/cursor; scheduler ordered+deduped+fenced, cap
+  truncates once, exact-fit-then-overflow; api ingest/read/409/404/400;
+  logship flush-on-close, size threshold, interval, retry resends
+  identical seqs, stale, rejected, Close ctx bound, done-ctx discard,
+  buffer cap marker; agent logs-before-complete-never-after, logs 409
+  kills a running attempt, final-flush 409 still reports; harness streams
+  300 KB of fake output through the real path with gapless seqs.
+- Flaky: nothing (agent/logship/harness 4× under `-race` clean).
+- Next: C09.
+known gap: reads return the whole tail in one response (no `limit`); no
+`/api/runner/jobs/{id}/logs` rate limiting; docker executor untouched —
+its `io.Writer` is simply the shipper now, but the real-executor path is
+only covered by `make test-docker`, not by the unit suite.
+
 ## C07 · executor/docker: volume-per-attempt job execution with source injection — done
 
 - Landed: `internal/executor/docker` — `New(Config{RunnerName, Source,

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -61,4 +62,29 @@ func (s *Store) ListEvents(ctx context.Context, q Querier, runID string, afterID
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// HasJobEvent reports whether an event of type typ exists for jobID whose
+// detail carries the given attempt. It lets a per-attempt event (such as
+// job.logs_truncated) be recorded exactly once.
+func (s *Store) HasJobEvent(ctx context.Context, q Querier, runID, jobID, typ string, attempt int) (bool, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT detail_json FROM events WHERE run_id = ? AND job_id = ? AND type = ?`, runID, jobID, typ)
+	if err != nil {
+		return false, fmt.Errorf("store: has event %s for job %s: %w", typ, jobID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return false, fmt.Errorf("store: has event %s for job %s: %w", typ, jobID, err)
+		}
+		var d struct {
+			Attempt int `json:"attempt"`
+		}
+		if json.Unmarshal(raw, &d) == nil && d.Attempt == attempt {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }

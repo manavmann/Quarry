@@ -372,6 +372,29 @@ func (c *Client) GetRun(id string) (*RunDetail, error) {
 	return &d, nil
 }
 
+// LogChunk is one stored piece of an attempt's output.
+type LogChunk struct {
+	Seq  int64  `json:"seq"`
+	Data []byte `json:"data"`
+}
+
+// Logs is GET /api/jobs/{id}/logs?after=: the chunks after the cursor and
+// the cursor to continue from.
+type Logs struct {
+	Attempt int        `json:"attempt"`
+	Chunks  []LogChunk `json:"chunks"`
+	Next    int64      `json:"next"`
+}
+
+// Logs reads job id's log chunks with seq > after.
+func (c *Client) Logs(id string, after int64) (*Logs, error) {
+	var l Logs
+	if err := c.do(http.MethodGet, "/api/jobs/"+id+"/logs?after="+strconv.FormatInt(after, 10), "", &l); err != nil {
+		return nil, err
+	}
+	return &l, nil
+}
+
 // Events lists a run's events in id order.
 func (c *Client) Events(id string) ([]Event, error) {
 	var reply struct {
@@ -463,5 +486,34 @@ func WaitFor(t *testing.T, cond func() bool, what string) {
 			t.Fatalf("timed out after %s waiting for %s", WaitTimeout, what)
 		case <-tick.C:
 		}
+	}
+}
+
+// LogText reads the whole log of job id through the cursor API, one
+// round-trip per chunk batch, and fails the test on error or on a seq gap.
+func (h *Harness) LogText(id string) string {
+	h.t.Helper()
+	var out []byte
+	var after int64
+	var next int64 = 1
+	for {
+		l, err := h.Client().Logs(id, after)
+		if err != nil {
+			h.t.Fatalf("logs %s: %v", id, err)
+		}
+		if len(l.Chunks) == 0 {
+			return string(out)
+		}
+		for _, c := range l.Chunks {
+			if c.Seq != next {
+				h.t.Fatalf("logs %s: seq %d after %d", id, c.Seq, next-1)
+			}
+			out = append(out, c.Data...)
+			next++
+		}
+		if l.Next != l.Chunks[len(l.Chunks)-1].Seq {
+			h.t.Fatalf("logs %s: next=%d, want %d", id, l.Next, l.Chunks[len(l.Chunks)-1].Seq)
+		}
+		after = l.Next
 	}
 }

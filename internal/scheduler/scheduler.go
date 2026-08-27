@@ -23,16 +23,21 @@ import (
 // DefaultLeaseTTL is how long a claim or heartbeat keeps a job leased.
 const DefaultLeaseTTL = 30 * time.Second
 
+// DefaultLogCapBytes bounds one attempt's stored log; output past it is
+// truncated and a job.logs_truncated event is recorded once.
+const DefaultLogCapBytes = 10 << 20
+
 // ErrFenced is returned when a runner-side write fails the
 // (state='running', attempt) check: the attempt is stale, the job was
 // requeued, or it is not running. Callers map it to 409.
 var ErrFenced = errors.New("scheduler: attempt is not the running attempt")
 
 // InvalidResultError is returned by Complete when the reported status or
-// failure kind is not one the protocol allows. Callers map it to 400.
+// failure kind is not one the protocol allows, and by AppendLogs for a bad
+// chunk seq. Callers map it to 400.
 type InvalidResultError struct{ Msg string }
 
-func (e *InvalidResultError) Error() string { return "scheduler: Complete: " + e.Msg }
+func (e *InvalidResultError) Error() string { return "scheduler: invalid request: " + e.Msg }
 
 // Heartbeat directives, one per reported job.
 const (
@@ -43,13 +48,15 @@ const (
 
 // Config tunes the scheduler; zero values take the defaults.
 type Config struct {
-	LeaseTTL time.Duration
+	LeaseTTL    time.Duration
+	LogCapBytes int64
 }
 
 // Scheduler applies the runner protocol over a store.
 type Scheduler struct {
-	st  *store.Store
-	ttl int64 // milliseconds
+	st     *store.Store
+	ttl    int64 // milliseconds
+	logCap int64
 }
 
 // New builds a Scheduler over st.
@@ -57,7 +64,10 @@ func New(st *store.Store, cfg Config) *Scheduler {
 	if cfg.LeaseTTL <= 0 {
 		cfg.LeaseTTL = DefaultLeaseTTL
 	}
-	return &Scheduler{st: st, ttl: cfg.LeaseTTL.Milliseconds()}
+	if cfg.LogCapBytes <= 0 {
+		cfg.LogCapBytes = DefaultLogCapBytes
+	}
+	return &Scheduler{st: st, ttl: cfg.LeaseTTL.Milliseconds(), logCap: cfg.LogCapBytes}
 }
 
 // LeaseTTL is the configured lease duration.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"quarry/internal/logship"
 	"quarry/internal/pipeline"
 )
 
@@ -75,6 +76,17 @@ type completeRequest struct {
 	FailureKind string `json:"failure_kind,omitempty"`
 	ExitCode    *int   `json:"exit_code,omitempty"`
 	Error       string `json:"error,omitempty"`
+}
+
+type logChunk struct {
+	Seq  int64  `json:"seq"`
+	Data []byte `json:"data"`
+}
+
+type logsRequest struct {
+	RunnerID string     `json:"runner_id"`
+	Attempt  int        `json:"attempt"`
+	Chunks   []logChunk `json:"chunks"`
 }
 
 // statusError is a non-2xx reply. Retryable reports whether the runner
@@ -178,6 +190,23 @@ func (c *client) complete(ctx context.Context, jobID string, req completeRequest
 	var se *statusError
 	if errors.As(err, &se) && se.Code == http.StatusConflict {
 		return errFenced
+	}
+	return err
+}
+
+// logs ships one batch of chunks for an attempt. It maps the reply onto
+// the shipper's contract: 409 → logship.ErrStale, any other 4xx →
+// logship.ErrRejected, transport errors and 5xx as they are (retried).
+func (c *client) logs(ctx context.Context, jobID string, req logsRequest) error {
+	_, err := c.post(ctx, "/api/runner/jobs/"+jobID+"/logs", req, nil)
+	var se *statusError
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &se) && se.Code == http.StatusConflict:
+		return logship.ErrStale
+	case errors.As(err, &se) && !se.Retryable():
+		return fmt.Errorf("%w: %v", logship.ErrRejected, err)
 	}
 	return err
 }

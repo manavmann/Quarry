@@ -38,10 +38,10 @@ func TestMigrateFreshDB(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	v, err := s.SchemaVersion(ctx)
-	if err != nil || v != 2 {
-		t.Fatalf("SchemaVersion = %d, %v; want 2", v, err)
+	if err != nil || v != 3 {
+		t.Fatalf("SchemaVersion = %d, %v; want 3", v, err)
 	}
-	for _, tbl := range []string{"runs", "jobs", "job_deps", "runners", "events"} {
+	for _, tbl := range []string{"runs", "jobs", "job_deps", "runners", "events", "log_chunks"} {
 		var n int
 		if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, tbl).Scan(&n); err != nil || n != 1 {
 			t.Errorf("table %s missing (n=%d, err=%v)", tbl, n, err)
@@ -64,8 +64,8 @@ func TestMigrateFreshDB(t *testing.T) {
 	}
 	defer s.Close()
 	var applied int
-	if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil || applied != 2 {
-		t.Fatalf("schema_migrations rows = %d, %v; want 2", applied, err)
+	if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil || applied != 3 {
+		t.Fatalf("schema_migrations rows = %d, %v; want 3", applied, err)
 	}
 }
 
@@ -325,5 +325,77 @@ func TestRunnerNamesAreUnique(t *testing.T) {
 	b := &Runner{ID: "rn2", Name: "box", Capacity: 1}
 	if err := s.Tx(ctx, func(tx *sql.Tx) error { return s.UpsertRunner(ctx, tx, b) }); err == nil {
 		t.Fatal("duplicate runner name was accepted")
+	}
+}
+
+func TestLogChunksDedupAndCursor(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	jobs := []Job{{ID: "j1", Name: "a", SpecJSON: []byte(`{}`)}}
+	if err := s.Tx(ctx, func(tx *sql.Tx) error { return s.CreateRun(ctx, tx, newRun("r1"), jobs, nil) }); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	// Out of order and duplicated delivery: 2, 1, 2 again, 3.
+	deliveries := []struct {
+		seq  int64
+		data string
+		want bool
+	}{{2, "two", true}, {1, "one", true}, {2, "TWO", false}, {3, "three", true}}
+	for _, d := range deliveries {
+		err := s.Tx(ctx, func(tx *sql.Tx) error {
+			ins, err := s.InsertLogChunk(ctx, tx, "j1", 1, d.seq, []byte(d.data))
+			if err != nil {
+				return err
+			}
+			if ins != d.want {
+				t.Errorf("seq %d: inserted=%v, want %v", d.seq, ins, d.want)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("insert seq %d: %v", d.seq, err)
+		}
+	}
+	got, err := s.ListLogChunks(ctx, s.Reader(), "j1", 1, 0)
+	if err != nil {
+		t.Fatalf("ListLogChunks: %v", err)
+	}
+	if len(got) != 3 || got[0].Seq != 1 || got[1].Seq != 2 || got[2].Seq != 3 || string(got[1].Data) != "two" {
+		t.Fatalf("chunks = %+v", got)
+	}
+	// Cursor is strictly greater-than: after=2 does not return seq 2.
+	if tail, _ := s.ListLogChunks(ctx, s.Reader(), "j1", 1, 2); len(tail) != 1 || tail[0].Seq != 3 {
+		t.Errorf("after=2: %+v", tail)
+	}
+	if n, err := s.LogBytes(ctx, s.Reader(), "j1", 1); err != nil || n != int64(len("onetwothree")) {
+		t.Errorf("LogBytes = %d, %v", n, err)
+	}
+	// Attempts are separate streams.
+	if other, _ := s.ListLogChunks(ctx, s.Reader(), "j1", 2, 0); len(other) != 0 {
+		t.Errorf("attempt 2 has chunks: %+v", other)
+	}
+}
+
+func TestHasJobEvent(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	if err := s.Tx(ctx, func(tx *sql.Tx) error {
+		if err := s.CreateRun(ctx, tx, newRun("r1"), []Job{{ID: "j1", Name: "a", SpecJSON: []byte(`{}`)}}, nil); err != nil {
+			return err
+		}
+		return s.AppendEvent(ctx, tx, &Event{RunID: "r1", JobID: "j1", Type: "job.logs_truncated", DetailJSON: []byte(`{"attempt":2}`)})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		typ     string
+		attempt int
+		want    bool
+	}{{"job.logs_truncated", 2, true}, {"job.logs_truncated", 1, false}, {"job.failed", 2, false}} {
+		got, err := s.HasJobEvent(ctx, s.Reader(), "r1", "j1", tc.typ, tc.attempt)
+		if err != nil || got != tc.want {
+			t.Errorf("HasJobEvent(%s, %d) = %v, %v; want %v", tc.typ, tc.attempt, got, err, tc.want)
+		}
 	}
 }

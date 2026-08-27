@@ -13,7 +13,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"quarry/internal/executor"
+	"quarry/internal/logship"
 )
 
 // Defaults for Config's zero values.
@@ -30,6 +30,7 @@ const (
 	DefaultCapacity          = 2
 	DefaultCompleteRetries   = 8
 	DefaultCompleteBackoff   = 500 * time.Millisecond
+	DefaultLogFlushTimeout   = 30 * time.Second
 	maxCompleteBackoff       = 10 * time.Second
 	// pollJitter is the fraction of PollInterval by which each wait varies,
 	// so a fleet started together does not poll in lockstep.
@@ -61,6 +62,13 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	CompleteRetries   int
 	CompleteBackoff   time.Duration
+
+	// LogFlushInterval and LogFlushBytes tune the per-attempt log shipper
+	// (logship.Config); LogFlushTimeout bounds the final flush that
+	// precedes complete. Zero values take logship's / the agent's defaults.
+	LogFlushInterval time.Duration
+	LogFlushBytes    int
+	LogFlushTimeout  time.Duration
 
 	// Logger receives one line per notable event; nil means log.Default().
 	Logger *log.Logger
@@ -117,6 +125,9 @@ func New(cfg Config, exec executor.Executor) (*Agent, error) {
 	}
 	if cfg.CompleteBackoff <= 0 {
 		cfg.CompleteBackoff = DefaultCompleteBackoff
+	}
+	if cfg.LogFlushTimeout <= 0 {
+		cfg.LogFlushTimeout = DefaultLogFlushTimeout
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
@@ -295,11 +306,35 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 		defer tcancel()
 	}
 
-	// Logs go nowhere until the log shipper (C08) lands.
-	res, execErr := a.exec.Run(ectx, spec, io.Discard)
+	// The executor streams into a shipper for this attempt. A 409 on a
+	// chunk means the attempt was superseded: kill it, exactly as a
+	// heartbeat abort would.
+	shipper := logship.New(logship.Config{
+		FlushInterval: a.cfg.LogFlushInterval, FlushBytes: a.cfg.LogFlushBytes,
+		OnStale: func() { cancel(errAbort) },
+	}, a.logSink(job))
+	res, execErr := a.exec.Run(ectx, spec, shipper)
+
+	// The verdict is fixed here, before the final flush: whatever the
+	// shipper learns from now on (a 409 on the tail, say) belongs to a
+	// finished execution and must not turn into an abort.
+	cause := context.Cause(ectx)
+	aborted := execErr != nil && errors.Is(cause, errAbort)
+
+	// Flush every buffered chunk synchronously; complete never precedes
+	// the last chunk. An aborted attempt has nothing the server would
+	// accept, so its buffer is just discarded.
+	flushCtx, stopFlush := context.WithTimeout(context.Background(), a.cfg.LogFlushTimeout)
+	if aborted {
+		stopFlush()
+	}
+	if err := shipper.Close(flushCtx); err != nil && !aborted && !errors.Is(err, logship.ErrStale) {
+		logger.Printf("job %s attempt %d: logs: %v", job.ID, job.Attempt, err)
+	}
+	stopFlush()
 
 	var req completeRequest
-	switch cause := context.Cause(ectx); {
+	switch {
 	case execErr == nil:
 		if res.ExitCode == 0 {
 			req = completeRequest{Status: statusSucceeded}
@@ -311,7 +346,7 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 			}
 			req = completeRequest{Status: statusFailed, FailureKind: kindExitCode, ExitCode: &code, Error: msg}
 		}
-	case errors.Is(cause, errAbort):
+	case aborted:
 		logger.Printf("job %s attempt %d: aborted by server, result discarded", job.ID, job.Attempt)
 		return
 	case errors.Is(cause, errTimeout):
@@ -398,5 +433,17 @@ func (a *Agent) apply(d directive) {
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel(cause)
+	}
+}
+
+// logSink is the shipper's delivery function for one attempt: each batch
+// is one POST /api/runner/jobs/{id}/logs carrying this runner's id.
+func (a *Agent) logSink(job *claimedJob) logship.Sink {
+	return func(ctx context.Context, chunks []logship.Chunk) error {
+		req := logsRequest{RunnerID: a.RunnerID(), Attempt: job.Attempt, Chunks: make([]logChunk, 0, len(chunks))}
+		for _, c := range chunks {
+			req.Chunks = append(req.Chunks, logChunk{Seq: c.Seq, Data: c.Data})
+		}
+		return a.client.logs(ctx, job.ID, req)
 	}
 }

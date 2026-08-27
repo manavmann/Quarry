@@ -7,6 +7,7 @@
 //	QUARRY_DB         SQLite database path       (default quarry.db)
 //	QUARRY_API_TOKEN  bearer token for /api/*    (required)
 //	QUARRY_LEASE_TTL  job lease duration          (default 30s)
+//	QUARRY_LOG_CAP    max log bytes per attempt  (default 10485760)
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -33,6 +35,7 @@ type config struct {
 	dbPath   string
 	apiToken string
 	leaseTTL time.Duration
+	logCap   int64
 }
 
 func loadConfig() (config, error) {
@@ -41,6 +44,7 @@ func loadConfig() (config, error) {
 		dbPath:   envOr("QUARRY_DB", "quarry.db"),
 		apiToken: os.Getenv("QUARRY_API_TOKEN"),
 		leaseTTL: scheduler.DefaultLeaseTTL,
+		logCap:   scheduler.DefaultLogCapBytes,
 	}
 	if c.apiToken == "" {
 		return c, errors.New("QUARRY_API_TOKEN must be set")
@@ -51,6 +55,13 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("QUARRY_LEASE_TTL: %q is not a positive duration", v)
 		}
 		c.leaseTTL = d
+	}
+	if v := os.Getenv("QUARRY_LOG_CAP"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return c, fmt.Errorf("QUARRY_LOG_CAP: %q is not a positive byte count", v)
+		}
+		c.logCap = n
 	}
 	return c, nil
 }
@@ -92,7 +103,7 @@ func run(logger *log.Logger) error {
 	srv := &http.Server{
 		Addr: cfg.listen,
 		Handler: api.New(st, api.Config{
-			APIToken: cfg.apiToken, Logger: logger, Scheduler: scheduler.Config{LeaseTTL: cfg.leaseTTL},
+			APIToken: cfg.apiToken, Logger: logger, Scheduler: scheduler.Config{LeaseTTL: cfg.leaseTTL, LogCapBytes: cfg.logCap},
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

@@ -123,6 +123,55 @@ Everything below happens in **one transaction**, in this order:
 Responses: `200` with the job as stored, `404` unknown job, `409` fence
 failure, `400` bad body.
 
+### `POST /api/runner/jobs/{id}/logs`
+
+```json
+{"runner_id": "r1", "attempt": 1,
+ "chunks": [{"seq": 7, "data": "<base64>"}, {"seq": 8, "data": "<base64>"}]}
+```
+
+Ships a batch of log chunks for one attempt. `seq` is assigned by the
+runner, 1-based and gapless per attempt; `data` is raw bytes, base64 in
+JSON. The body may be up to 1 MiB. In one transaction:
+
+1. **Fence.** `state='running' AND attempt=?` must hold, else `409`.
+   Unlike `complete`, a chunk for a finished attempt is *not* a no-op:
+   the runner flushes its shipper before it sends `complete`, so a chunk
+   arriving after that is a bug or a superseded attempt either way.
+2. **Store.** `INSERT OR IGNORE` on `log_chunks(job_id, attempt, seq)`:
+   a redelivered batch (same seqs, same bytes) changes nothing, and
+   out-of-order batches read back in `seq` order.
+3. **Cap.** An attempt keeps at most `QUARRY_LOG_CAP` bytes (default
+   10 MiB). The chunk that crosses the cap is cut to fit, later chunks
+   are stored empty (their seq is kept so redelivery still dedups), and
+   `job.logs_truncated` `{"attempt", "cap_bytes"}` is recorded once.
+
+Responses: `204`, `409` fence failure, `404` unknown job, `400` bad body
+or `seq < 1`.
+
+The runner's shipper (`internal/logship`) buffers the executor's output
+and flushes every 250 ms or at 64 KiB, whichever comes first; a chunk's
+seq is assigned once when it is sealed, so a retried POST carries the
+identical payload. On `409` it drops its buffer and the runner kills the
+attempt, exactly as for a heartbeat `abort`. Before `complete` the runner
+closes the shipper and waits for its final flush, so `complete` never
+overtakes the last chunk — and a `409` met by that final flush is treated
+as a late answer about a finished execution, not as an abort.
+
+### `GET /api/jobs/{id}/logs?after=N&attempt=A`
+
+User endpoint, same token. Returns the chunks of attempt `A` (default:
+the job's current attempt) with `seq > N` (default 0, i.e. everything) in
+`seq` order:
+
+```json
+{"attempt": 1, "chunks": [{"seq": 3, "data": "<base64>"}], "next": 3}
+```
+
+`next` is the last `seq` returned, or the `after` that was asked for when
+nothing was; clients pass it straight back as the next `after=`. The
+cursor is strictly greater-than: `after=N` never returns chunk `N` again.
+
 ## Fencing rule
 
 Every runner-side write — heartbeat, log chunk, artifact, completion —

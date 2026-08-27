@@ -58,11 +58,13 @@ func New(st *store.Store, cfg Config) *Server {
 	api.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
 	api.HandleFunc("GET /api/runs/{id}/events", s.handleListEvents)
 	api.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
+	api.HandleFunc("GET /api/jobs/{id}/logs", s.handleGetLogs)
 	api.HandleFunc("GET /api/runners", s.handleListRunners)
 	api.HandleFunc("POST /api/runner/register", s.handleRegister)
 	api.HandleFunc("POST /api/runner/claim", s.handleClaim)
 	api.HandleFunc("POST /api/runner/heartbeat", s.handleHeartbeat)
 	api.HandleFunc("POST /api/runner/jobs/{id}/complete", s.handleComplete)
+	api.HandleFunc("POST /api/runner/jobs/{id}/logs", s.handleAppendLogs)
 	s.mux.Handle("/api/", s.requireToken(api))
 	return s
 }

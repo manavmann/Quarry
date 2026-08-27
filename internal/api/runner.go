@@ -12,9 +12,9 @@ import (
 )
 
 // Runner protocol (docs/protocol.md): /api/runner/register, /claim,
-// /heartbeat and /jobs/{id}/complete. Handlers decode, call the store or
-// scheduler, encode; the fencing and advancement rules live in
-// internal/scheduler.
+// /heartbeat and /jobs/{id}/complete; logs.go has /jobs/{id}/logs. Handlers
+// decode, call the store or scheduler, encode; the fencing and advancement
+// rules live in internal/scheduler.
 
 // MaxRunnerBodyBytes bounds a runner request body.
 const MaxRunnerBodyBytes = 64 << 10
@@ -57,10 +57,16 @@ type completeRequest struct {
 	Error       string `json:"error"`
 }
 
-// decodeRunnerBody reads a bounded JSON body into v, writing 400/413 and
-// returning false on failure.
+// decodeBody reads a JSON body of at most limit bytes into v, writing
+// 400/413 and returning false on failure; decodeRunnerBody applies the
+// runner protocol's default bound.
+
 func (s *Server) decodeRunnerBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRunnerBodyBytes))
+	return s.decodeBody(w, r, v, MaxRunnerBodyBytes)
+}
+
+func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {

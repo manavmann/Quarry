@@ -223,3 +223,42 @@ func count(ss []string, s string) int {
 	}
 	return n
 }
+
+func TestLogsStreamFromFakeExecutor(t *testing.T) {
+	h := New(t, Opts{Agents: 2})
+	// 300 KB of output crosses several 64 KB chunks; the empty job ships
+	// nothing. Both go through the real shipper → API → store path.
+	h.Script("build", executor.Outcome{LogBytes: 300_000})
+	run := h.Submit(diamond)
+	d := h.WaitRun(run.Run.ID)
+	if d.Run.State != store.RunSucceeded {
+		t.Fatalf("run = %+v", d.Run)
+	}
+
+	text := h.LogText(d.Job("build").ID)
+	if len(text) != 300_000 {
+		t.Fatalf("build log is %d bytes, want 300000", len(text))
+	}
+	const line = "fake executor output line\n"
+	for i := 0; i+len(line) <= len(text); i += len(line) {
+		if text[i:i+len(line)] != line {
+			t.Fatalf("log corrupted at byte %d: %q", i, text[i:i+len(line)])
+		}
+	}
+	if got := h.LogText(d.Job("deploy").ID); got != "" {
+		t.Fatalf("deploy log = %q, want empty", got)
+	}
+	// The cursor round-trips: reading after the last seq is empty and
+	// keeps the cursor.
+	l, err := h.Client().Logs(d.Job("build").ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail, err := h.Client().Logs(d.Job("build").ID, l.Next)
+	if err != nil || len(tail.Chunks) != 0 || tail.Next != l.Next {
+		t.Fatalf("tail = %+v, %v", tail, err)
+	}
+	if slices.Contains(h.EventTypes(run.Run.ID), "job.logs_truncated") {
+		t.Fatal("unexpected truncation event")
+	}
+}

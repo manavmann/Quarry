@@ -479,3 +479,148 @@ func TestRunWithCancelledSiblingStillTerminates(t *testing.T) {
 		t.Fatalf("run = %+v, want cancelled and finished", r)
 	}
 }
+
+// ---- logs ---------------------------------------------------------------
+
+func appendLogs(t *testing.T, s *Scheduler, j *store.Job, chunks ...store.LogChunk) error {
+	t.Helper()
+	return s.AppendLogs(context.Background(), j.ID, j.Attempt, chunks)
+}
+
+func chunk(seq int64, data string) store.LogChunk {
+	return store.LogChunk{Seq: seq, Data: []byte(data)}
+}
+
+func readLog(t *testing.T, st *store.Store, j *store.Job, after int64) (string, []int64) {
+	t.Helper()
+	cs, err := st.ListLogChunks(context.Background(), st.Reader(), j.ID, j.Attempt, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b []byte
+	var seqs []int64
+	for _, c := range cs {
+		b = append(b, c.Data...)
+		seqs = append(seqs, c.Seq)
+	}
+	return string(b), seqs
+}
+
+func TestAppendLogsOrderedDedupedAndFenced(t *testing.T) {
+	s, st, _ := newScheduler(t, time.Minute)
+	dag(t, st, []string{"a"}, map[string]spec{"a": {}})
+	j := claim(t, s, "r1", nil)
+
+	// Out-of-order across batches, a duplicate inside a batch and a
+	// redelivered batch all read back as one ordered stream.
+	if err := appendLogs(t, s, j, chunk(2, "two "), chunk(3, "three ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendLogs(t, s, j, chunk(1, "one "), chunk(1, "ONE ")); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendLogs(t, s, j, chunk(2, "two "), chunk(3, "three ")); err != nil {
+		t.Fatal(err)
+	}
+	if text, seqs := readLog(t, st, j, 0); text != "one two three " || len(seqs) != 3 {
+		t.Fatalf("log = %q seqs %v", text, seqs)
+	}
+	if text, _ := readLog(t, st, j, 2); text != "three " {
+		t.Errorf("after=2: %q", text)
+	}
+
+	// Fence: wrong attempt, unknown job, bad seq.
+	if err := s.AppendLogs(context.Background(), j.ID, j.Attempt+1, []store.LogChunk{chunk(4, "x")}); !errors.Is(err, ErrFenced) {
+		t.Errorf("stale attempt: %v, want ErrFenced", err)
+	}
+	if err := s.AppendLogs(context.Background(), "nope", 1, []store.LogChunk{chunk(1, "x")}); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("unknown job: %v, want ErrNotFound", err)
+	}
+	var bad *InvalidResultError
+	if err := appendLogs(t, s, j, chunk(0, "x")); !errors.As(err, &bad) {
+		t.Errorf("seq 0: %v, want InvalidResultError", err)
+	}
+
+	// After completion the attempt is no longer running: a late chunk is
+	// fenced and the stored log is unchanged.
+	complete(t, s, j, ok)
+	if err := appendLogs(t, s, j, chunk(4, "late")); !errors.Is(err, ErrFenced) {
+		t.Errorf("after complete: %v, want ErrFenced", err)
+	}
+	if text, _ := readLog(t, st, j, 0); text != "one two three " {
+		t.Errorf("log after fenced write = %q", text)
+	}
+}
+
+func TestAppendLogsCapTruncatesOnce(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "quarry.db"), store.WithClock(clk.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s := New(st, Config{LeaseTTL: time.Minute, LogCapBytes: 10})
+	runID, _ := dag(t, st, []string{"a"}, map[string]spec{"a": {}})
+	j := claim(t, s, "r1", nil)
+
+	if err := appendLogs(t, s, j, chunk(1, "1234"), chunk(2, "5678")); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(eventTypes(t, st, runID), EventLogsTruncated); n != 0 {
+		t.Fatalf("truncated event before cap: %d", n)
+	}
+	// Chunk 3 crosses the cap: cut to fit, one event.
+	if err := appendLogs(t, s, j, chunk(3, "9abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	text, seqs := readLog(t, st, j, 0)
+	if text != "123456789a" || len(seqs) != 3 {
+		t.Fatalf("log = %q seqs %v", text, seqs)
+	}
+	// Chunk 4 is past the cap: kept as an empty row, no second event, and
+	// redelivering it (or chunk 3) changes nothing.
+	for i := 0; i < 2; i++ {
+		if err := appendLogs(t, s, j, chunk(3, "9abcdef"), chunk(4, "more")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	text, seqs = readLog(t, st, j, 0)
+	if text != "123456789a" || len(seqs) != 4 || seqs[3] != 4 {
+		t.Fatalf("log after overflow = %q seqs %v", text, seqs)
+	}
+	if n, _ := st.LogBytes(context.Background(), st.Reader(), j.ID, j.Attempt); n != 10 {
+		t.Errorf("LogBytes = %d, want 10", n)
+	}
+	if n := count(eventTypes(t, st, runID), EventLogsTruncated); n != 1 {
+		t.Errorf("truncated events = %d, want exactly 1", n)
+	}
+}
+
+func TestAppendLogsCapExactFitThenOverflowRecordsEvent(t *testing.T) {
+	clk := &fakeClock{}
+	clk.ms.Store(1_700_000_000_000)
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "quarry.db"), store.WithClock(clk.now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s := New(st, Config{LeaseTTL: time.Minute, LogCapBytes: 4})
+	runID, _ := dag(t, st, []string{"a"}, map[string]spec{"a": {}})
+	j := claim(t, s, "r1", nil)
+
+	// Exactly at the cap is not truncation ...
+	if err := appendLogs(t, s, j, chunk(1, "1234")); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(eventTypes(t, st, runID), EventLogsTruncated); n != 0 {
+		t.Fatalf("event at exact fit: %d", n)
+	}
+	// ... the first byte past it is.
+	if err := appendLogs(t, s, j, chunk(2, "5")); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(eventTypes(t, st, runID), EventLogsTruncated); n != 1 {
+		t.Errorf("truncated events = %d, want 1", n)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,6 +32,13 @@ type stubServer struct {
 	claims     []claimRequest
 	heartbeats [][]jobRef
 	completes  []completeCall
+	// ops is the interleaving of log and complete arrivals per job, e.g.
+	// ["logs", "logs", "complete"], for ordering assertions.
+	ops map[string][]string
+	// logs is every chunk received per job, in arrival order.
+	logs map[string][]logChunk
+	// logsStatus, when non-zero, is returned to every log POST.
+	logsStatus int
 	directive  string // applied to every heartbeated attempt; "" = continue
 	// completeStatus is popped per complete call; empty means 200.
 	completeStatus []int
@@ -43,12 +51,13 @@ type completeCall struct {
 
 func newStub(t *testing.T) *stubServer {
 	t.Helper()
-	s := &stubServer{t: t}
+	s := &stubServer{t: t, ops: map[string][]string{}, logs: map[string][]logChunk{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/runner/register", s.handleRegister)
 	mux.HandleFunc("POST /api/runner/claim", s.handleClaim)
 	mux.HandleFunc("POST /api/runner/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST /api/runner/jobs/{id}/complete", s.handleComplete)
+	mux.HandleFunc("POST /api/runner/jobs/{id}/logs", s.handleLogs)
 	s.srv = httptest.NewServer(mux)
 	t.Cleanup(s.srv.Close)
 	return s
@@ -119,6 +128,7 @@ func (s *stubServer) handleComplete(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.completes = append(s.completes, completeCall{JobID: r.PathValue("id"), Req: req})
+	s.ops[r.PathValue("id")] = append(s.ops[r.PathValue("id")], "complete")
 	if len(s.completeStatus) > 0 {
 		code := s.completeStatus[0]
 		s.completeStatus = s.completeStatus[1:]
@@ -386,5 +396,159 @@ func TestAgentShutdownReportsInfra(t *testing.T) {
 	c := s.completed()
 	if len(c) != 1 || c[0].Req.FailureKind != kindInfra || c[0].Req.Error != errShutdown.Error() {
 		t.Fatalf("completes = %+v", c)
+	}
+}
+
+func (s *stubServer) handleLogs(w http.ResponseWriter, r *http.Request) {
+	var req logsRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := r.PathValue("id")
+	s.ops[id] = append(s.ops[id], "logs")
+	if s.logsStatus != 0 {
+		http.Error(w, "scripted", s.logsStatus)
+		return
+	}
+	if req.RunnerID != "id-r1" || req.Attempt != 1 {
+		s.t.Errorf("log POST for %s carries runner %q attempt %d", id, req.RunnerID, req.Attempt)
+	}
+	s.logs[id] = append(s.logs[id], req.Chunks...)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// logText joins job id's chunks in seq order, failing on a gap or a
+// duplicate: the shipper's seqs are 1-based and gapless.
+func (s *stubServer) logText(t *testing.T, id string) string {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []byte
+	for i, c := range s.logs[id] {
+		if c.Seq != int64(i+1) {
+			t.Fatalf("chunk %d of %s has seq %d", i, id, c.Seq)
+		}
+		out = append(out, c.Data...)
+	}
+	return string(out)
+}
+
+func (s *stubServer) opsFor(id string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.ops[id]...)
+}
+
+func TestAgentShipsLogsBeforeCompleteAndNeverAfter(t *testing.T) {
+	s := newStub(t)
+	s.enqueue("chatty", 0)
+	s.enqueue("quiet", 0)
+	f := executor.NewFake()
+	// 200 KB spans several 64 KB chunks; the 1 h interval means only the
+	// size threshold and the close-before-complete flush can ship them.
+	f.Script("chatty", executor.Outcome{LogBytes: 200_000})
+	a, err := New(func() Config {
+		c := testConfig(s, 2)
+		c.LogFlushInterval = time.Hour
+		return c
+	}(), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = a.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	waitFor(t, func() bool { return len(s.completed()) == 2 }, "two completions")
+	// Stop the agent so nothing can still be in flight, then check order.
+	cancel()
+	<-done
+
+	text := s.logText(t, "j-chatty")
+	if len(text) != 200_000 || !strings.HasPrefix(text, "fake executor output line\n") {
+		t.Fatalf("chatty log: %d bytes, prefix %q", len(text), text[:min(len(text), 30)])
+	}
+	ops := s.opsFor("j-chatty")
+	if len(ops) < 2 || ops[len(ops)-1] != "complete" {
+		t.Fatalf("ops for chatty = %v: complete must be last", ops)
+	}
+	for _, op := range ops[:len(ops)-1] {
+		if op != "logs" {
+			t.Fatalf("ops for chatty = %v", ops)
+		}
+	}
+	// A job with no output ships nothing at all.
+	if ops := s.opsFor("j-quiet"); len(ops) != 1 || ops[0] != "complete" {
+		t.Fatalf("ops for quiet = %v", ops)
+	}
+}
+
+func TestAgentLogs409AbortsAttempt(t *testing.T) {
+	s := newStub(t)
+	s.mu.Lock()
+	s.logsStatus = http.StatusConflict
+	s.mu.Unlock()
+	s.enqueue("hang", 0)
+	f := executor.NewFake()
+	// Output before hanging: the first flush meets the 409 while the job
+	// is still running, which must kill it like a heartbeat abort.
+	f.Script("hang", executor.Outcome{Hang: true, LogBytes: 10})
+	a, err := New(func() Config {
+		c := testConfig(s, 1)
+		c.LogFlushInterval = time.Millisecond
+		return c
+	}(), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = a.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	waitFor(t, func() bool { ex := f.Executions(); return len(ex) == 1 && ex[0].Err != nil }, "executor to be killed")
+	if err := f.Executions()[0].Err; !errors.Is(err, context.Canceled) {
+		t.Fatalf("executor err = %v", err)
+	}
+	waitFor(t, func() bool { return len(a.activeRefs()) == 0 }, "attempt to be forgotten")
+	if c := s.completed(); len(c) != 0 {
+		t.Fatalf("stale attempt was reported: %+v", c)
+	}
+	if ops := s.opsFor("j-hang"); len(ops) != 1 {
+		t.Fatalf("ops = %v: exactly one log POST (the 409) and nothing after", ops)
+	}
+}
+
+func TestAgentLogs409AfterFinishDoesNotSuppressComplete(t *testing.T) {
+	// The job exits on its own; only its final flush meets a 409. That
+	// 409 belongs to a finished execution and must not become an abort:
+	// the result is still reported (the server will fence it itself).
+	s := newStub(t)
+	s.mu.Lock()
+	s.logsStatus = http.StatusConflict
+	s.mu.Unlock()
+	s.enqueue("out", 0)
+	f := executor.NewFake()
+	f.Script("out", executor.Outcome{LogBytes: 10, ExitCode: 0})
+	a, err := New(func() Config {
+		c := testConfig(s, 1)
+		c.LogFlushInterval = time.Hour
+		return c
+	}(), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = a.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	waitFor(t, func() bool { return len(s.completed()) == 1 }, "completion")
+	if c := s.completed()[0]; c.Req.Status != statusSucceeded {
+		t.Fatalf("complete = %+v", c.Req)
+	}
+	if ops := s.opsFor("j-out"); len(ops) != 2 || ops[0] != "logs" || ops[1] != "complete" {
+		t.Fatalf("ops = %v", ops)
 	}
 }

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
@@ -470,5 +471,86 @@ func TestRunnerRegisterIsIdempotentByName(t *testing.T) {
 	}
 	if resp := do(t, srv, "POST", "/api/runner/register", `{"name":"x","capacity":-1}`, nil); resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("register with negative capacity: status=%d, want 400", resp.StatusCode)
+	}
+}
+
+func TestRunnerLogsIngestAndCursorRead(t *testing.T) {
+	srv, _ := newTestServer(t)
+	var created runDetailJSON
+	do(t, srv, "POST", "/api/runs", validYAML, &created)
+	var claimed claimedJSON
+	do(t, srv, "POST", "/api/runner/claim", `{"runner_id":"r1","name":"one","capacity":1}`, &claimed)
+	job := claimed.Job
+	logsPath := "/api/runner/jobs/" + job.ID + "/logs"
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+	// Out of order, then a duplicate batch: both 204.
+	body := `{"runner_id":"r1","attempt":1,"chunks":[{"seq":2,"data":"` + b64("two\n") + `"},{"seq":3,"data":"` + b64("three\n") + `"}]}`
+	if resp := do(t, srv, "POST", logsPath, body, nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("logs 1: %d", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", logsPath, body, nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("logs redelivery: %d", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", logsPath, `{"runner_id":"r1","attempt":1,"chunks":[{"seq":1,"data":"`+b64("one\n")+`"}]}`, nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("logs 2: %d", resp.StatusCode)
+	}
+	// Fence and validation.
+	if resp := do(t, srv, "POST", logsPath, `{"runner_id":"r1","attempt":2,"chunks":[{"seq":4,"data":"eA=="}]}`, nil); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("stale attempt: %d, want 409", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", "/api/runner/jobs/nope/logs", `{"runner_id":"r1","attempt":1,"chunks":[]}`, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown job: %d, want 404", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", logsPath, `{"runner_id":"r1","attempt":1,"chunks":[{"seq":0,"data":"eA=="}]}`, nil); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("seq 0: %d, want 400", resp.StatusCode)
+	}
+	if resp := do(t, srv, "POST", logsPath, `{"attempt":1,"chunks":[]}`, nil); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("no runner_id: %d, want 400", resp.StatusCode)
+	}
+
+	// Reads: ordered, next round-trips, after is strictly greater-than.
+	var got logsResponse
+	do(t, srv, "GET", "/api/jobs/"+job.ID+"/logs", "", &got)
+	if got.Attempt != 1 || got.Next != 3 || len(got.Chunks) != 3 {
+		t.Fatalf("logs = %+v", got)
+	}
+	var text string
+	for i, c := range got.Chunks {
+		if c.Seq != int64(i+1) {
+			t.Errorf("chunk %d has seq %d", i, c.Seq)
+		}
+		text += string(c.Data)
+	}
+	if text != "one\ntwo\nthree\n" {
+		t.Errorf("text = %q", text)
+	}
+	do(t, srv, "GET", "/api/jobs/"+job.ID+"/logs?after=2", "", &got)
+	if len(got.Chunks) != 1 || got.Chunks[0].Seq != 3 || got.Next != 3 {
+		t.Errorf("after=2: %+v", got)
+	}
+	do(t, srv, "GET", "/api/jobs/"+job.ID+"/logs?after=3", "", &got)
+	if len(got.Chunks) != 0 || got.Next != 3 {
+		t.Errorf("after=3: %+v", got)
+	}
+	do(t, srv, "GET", "/api/jobs/"+job.ID+"/logs?attempt=2", "", &got)
+	if len(got.Chunks) != 0 || got.Attempt != 2 || got.Next != 0 {
+		t.Errorf("attempt=2: %+v", got)
+	}
+	if resp := do(t, srv, "GET", "/api/jobs/"+job.ID+"/logs?after=-1", "", nil); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("after=-1: %d", resp.StatusCode)
+	}
+	if resp := do(t, srv, "GET", "/api/jobs/nope/logs", "", nil); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown job read: %d", resp.StatusCode)
+	}
+
+	// Once the attempt has completed, a late chunk is fenced.
+	do(t, srv, "POST", "/api/runner/jobs/"+job.ID+"/complete", `{"runner_id":"r1","attempt":1,"status":"succeeded"}`, nil)
+	if resp := do(t, srv, "POST", logsPath, `{"runner_id":"r1","attempt":1,"chunks":[{"seq":4,"data":"eA=="}]}`, nil); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("after complete: %d, want 409", resp.StatusCode)
+	}
+	do(t, srv, "GET", "/api/jobs/"+job.ID+"/logs", "", &got)
+	if got.Next != 3 {
+		t.Errorf("log grew after complete: %+v", got)
 	}
 }
