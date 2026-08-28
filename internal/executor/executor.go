@@ -19,6 +19,12 @@ type JobSpec struct {
 	RunID   string
 	Attempt int
 	Job     pipeline.Job
+	// ArtifactDir, when set, is an empty directory owned by the runner
+	// into which a successful Run copies the files of every declared
+	// artifact, laid out as <ArtifactDir>/<artifact path>/<files>. The
+	// runner uploads what it finds there and removes the directory; an
+	// executor never uploads. Empty means the job declares no artifacts.
+	ArtifactDir string
 }
 
 // Result is how a finished job ended. A non-zero ExitCode is the

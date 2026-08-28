@@ -1,10 +1,14 @@
 package harness
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"quarry/internal/artifact"
 	"quarry/internal/executor"
 	"quarry/internal/store"
 )
@@ -260,5 +264,85 @@ func TestLogsStreamFromFakeExecutor(t *testing.T) {
 	}
 	if slices.Contains(h.EventTypes(run.Run.ID), "job.logs_truncated") {
 		t.Fatal("unexpected truncation event")
+	}
+}
+
+// artifactsPipeline is one job that declares artifacts; the fake executor
+// is scripted to leave files behind for them.
+const artifactsPipeline = `name: artifacts
+jobs:
+  - name: build
+    image: alpine
+    steps: ["make"]
+    artifacts: ["dist", "report.txt"]
+`
+
+func sha(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}
+
+// A succeeding job's artifacts travel runner → server → store and come
+// back listed with their sha256 and downloadable byte-for-byte.
+func TestArtifactsAreUploadedListedAndDownloadable(t *testing.T) {
+	h := New(t, Opts{})
+	files := map[string]string{"dist/app.bin": "binary bytes", "dist/sub/notes.md": "# notes", "report.txt": "ok\n"}
+	h.Script("build", executor.Outcome{Artifacts: files})
+
+	run := h.Submit(artifactsPipeline)
+	done := h.WaitRun(run.Run.ID)
+	build := done.Job("build")
+	if done.Run.State != store.RunSucceeded || build.State != store.JobSucceeded {
+		t.Fatalf("run = %s build = %+v", done.Run.State, build)
+	}
+	arts, err := h.Client().Artifacts(build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(arts) != len(files) {
+		t.Fatalf("artifacts = %+v", arts)
+	}
+	for _, a := range arts {
+		want, ok := files[a.Path]
+		if !ok || a.SizeBytes != int64(len(want)) || a.SHA256 != sha(want) {
+			t.Errorf("artifact %+v does not match %q", a, want)
+		}
+		got, err := h.Client().Download(build.ID, a.Path)
+		if err != nil || string(got) != want {
+			t.Errorf("download %s = %q, %v; want %q", a.Path, got, err, want)
+		}
+	}
+	// The store holds exactly these keys, under the attempt's prefix.
+	keys, err := h.ArtifactStore().List(t.Context(), artifact.JobPrefix(run.Run.ID, build.ID, 1))
+	if err != nil || len(keys) != len(files) {
+		t.Fatalf("store keys = %v, %v", keys, err)
+	}
+	if text := h.LogText(build.ID); !strings.Contains(text, "[quarry] uploaded artifact dist/app.bin (12 bytes)\n") {
+		t.Errorf("log lacks upload line:\n%s", text)
+	}
+}
+
+// When the server cannot write to the artifact store the upload is a 500,
+// the runner retries and then reports the attempt as an infra failure:
+// the job never succeeds with missing artifacts. (max_attempts is 1 today,
+// so the failure is terminal rather than requeued, as in
+// TestInfraFailureIsReported.)
+func TestArtifactStoreFailureIsInfra(t *testing.T) {
+	h := New(t, Opts{})
+	h.Script("build", executor.Outcome{Artifacts: map[string]string{"report.txt": "x"}})
+	h.FailArtifactPuts(true)
+
+	run := h.Submit(artifactsPipeline)
+	done := h.WaitRun(run.Run.ID)
+	build := done.Job("build")
+	if build.State != store.JobFailed || build.FailureKind != "infra" || !strings.Contains(build.Error, "upload artifacts") {
+		t.Fatalf("build = %+v, want failed(infra) from the upload", build)
+	}
+	arts, err := h.Client().Artifacts(build.ID)
+	if err != nil || len(arts) != 0 {
+		t.Fatalf("artifacts = %+v, %v; want none", arts, err)
+	}
+	if keys, _ := h.ArtifactStore().List(t.Context(), "runs/"); len(keys) != 0 {
+		t.Fatalf("store keys = %v, want none", keys)
 	}
 }

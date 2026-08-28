@@ -11,6 +11,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,8 @@ import (
 
 	"quarry/internal/agent"
 	"quarry/internal/api"
+	"quarry/internal/artifact"
+	"quarry/internal/artifact/local"
 	"quarry/internal/executor"
 	"quarry/internal/scheduler"
 	"quarry/internal/store"
@@ -64,6 +67,7 @@ type Harness struct {
 	srv   *httptest.Server
 	http  *http.Client
 	clock *Clock
+	blobs *faultStore
 	execs []*executor.FakeExecutor
 	ags   []*runner
 }
@@ -126,8 +130,13 @@ func New(t *testing.T, opts Opts) *Harness {
 		t.Fatalf("harness: open store: %v", err)
 	}
 	h.st = st
+	blobs, err := local.New(filepath.Join(dir, "blobs"))
+	if err != nil {
+		t.Fatalf("harness: open artifact store: %v", err)
+	}
+	h.blobs = &faultStore{Store: blobs}
 	h.srv = httptest.NewServer(api.New(st, api.Config{
-		APIToken: Token, Logger: h.log, Scheduler: scheduler.Config{LeaseTTL: opts.LeaseTTL},
+		APIToken: Token, Logger: h.log, Scheduler: scheduler.Config{LeaseTTL: opts.LeaseTTL}, Artifacts: h.blobs,
 	}))
 	WaitFor(t, func() bool {
 		resp, err := h.http.Get(h.srv.URL + "/healthz")
@@ -516,4 +525,70 @@ func (h *Harness) LogText(id string) string {
 		}
 		after = l.Next
 	}
+}
+
+// ---- artifact store -----------------------------------------------------
+
+// faultStore wraps the server's artifact store so a test can make every
+// Put fail, standing in for a full disk or an unreachable bucket.
+type faultStore struct {
+	artifact.Store
+	failPuts atomic.Bool
+}
+
+var errStoreDown = errors.New("harness: artifact store failure injected")
+
+func (f *faultStore) Put(ctx context.Context, key string, r io.Reader, size int64) error {
+	if f.failPuts.Load() {
+		return errStoreDown
+	}
+	return f.Store.Put(ctx, key, r, size)
+}
+
+// FailArtifactPuts makes every artifact store write fail (or stop
+// failing) from now on.
+func (h *Harness) FailArtifactPuts(fail bool) { h.blobs.failPuts.Store(fail) }
+
+// ArtifactStore is the server's blob store, for asserting on keys.
+func (h *Harness) ArtifactStore() artifact.Store { return h.blobs }
+
+// Artifact is one row of GET /api/jobs/{id}/artifacts.
+type Artifact struct {
+	Path        string `json:"path"`
+	SizeBytes   int64  `json:"size_bytes"`
+	SHA256      string `json:"sha256"`
+	ContentType string `json:"content_type"`
+}
+
+// Artifacts lists job id's artifacts for its current attempt.
+func (c *Client) Artifacts(id string) ([]Artifact, error) {
+	var reply struct {
+		Artifacts []Artifact `json:"artifacts"`
+	}
+	if err := c.do(http.MethodGet, "/api/jobs/"+id+"/artifacts", "", &reply); err != nil {
+		return nil, err
+	}
+	return reply.Artifacts, nil
+}
+
+// Download fetches one artifact of job id's current attempt.
+func (c *Client) Download(id, path string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, c.h.srv.URL+"/api/jobs/"+id+"/artifacts/"+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+Token)
+	resp, err := c.h.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET artifact %s: %d: %s", path, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return raw, nil
 }

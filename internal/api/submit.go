@@ -21,9 +21,9 @@ const TriggerAPI = "api"
 //
 // This is deliberately not an HTTP handler: it is the only piece of
 // submission logic in the package and the scheduler may later own it.
-func submitRun(ctx context.Context, st *store.Store, p *pipeline.Pipeline, src string) (*store.Run, []store.Job, error) {
+func submitRun(ctx context.Context, st *store.Store, runID string, p *pipeline.Pipeline, src string) (*store.Run, []store.Job, error) {
 	run := &store.Run{
-		ID:           newID(8),
+		ID:           runID,
 		PipelineYAML: src,
 		Trigger:      TriggerAPI,
 		State:        store.RunPending,

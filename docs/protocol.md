@@ -172,6 +172,76 @@ the job's current attempt) with `seq > N` (default 0, i.e. everything) in
 nothing was; clients pass it straight back as the next `after=`. The
 cursor is strictly greater-than: `after=N` never returns chunk `N` again.
 
+### `POST /api/runner/jobs/{id}/attempts/{attempt}/artifacts/{path}`
+
+The request body is one artifact file, raw; `Content-Length` is required
+(`411` without it) and bounded at 1 GiB (`413`); `Content-Type` is
+recorded (default `application/octet-stream`). `{path}` is the file's
+slash-relative name under the attempt (`dist/app.bin`) and must be a
+plain relative path: no empty, `.` or `..` segments, no backslash or
+control characters (`400`). The server is the only writer to the
+artifact store:
+
+1. **Fence.** `state='running' AND attempt=?` must hold, else `409` —
+   checked before anything is written so a stale runner cannot fill the
+   store.
+2. **Stream.** The body goes straight through to `ArtifactStore.Put`
+   under `runs/<run>/jobs/<job>/<attempt>/<path>`, hashed as it passes;
+   nothing is buffered whole. A store failure is `500` and the runner
+   retries.
+3. **Record.** In one transaction the fence is checked again and the
+   `artifacts(job_id, attempt, path, size_bytes, sha256, content_type,
+   created_at)` row is upserted. A fence failure here deletes the object
+   just written (`409`). The row exists only once the bytes do, never
+   the other way round; a redelivered upload overwrites both.
+
+Responses: `201 {"path", "size_bytes", "sha256", "content_type",
+"created_at"}`, `409`, `404` unknown job, `400`, `411`, `413`.
+
+The runner collects artifacts only after a zero exit: the executor copies
+each declared path out of the container (`CopyFromContainer` returns a
+tar rooted at the path's *parent*, so the leading `<basename>/` component
+is stripped or `dist` would extract as `dist/dist/…`) into a per-attempt
+directory, and the runner POSTs each regular file in it, one request per
+file, in lexical order, before its final log flush and before `complete`.
+The runner hashes the file as it streams it and compares the reply's
+`sha256`/`size_bytes` with its own once the request is done: by then the
+server has already stored the object and its row, so this detects a
+mismatch after the upload completes, retries the whole upload, and fails
+the attempt as infra if it persists. Transport errors and `5xx` are
+likewise retried with the completion backoff; when the retries are
+exhausted the attempt is reported `failed(infra)` — a job never succeeds
+with artifacts missing. A `409` aborts the attempt like a stale log batch would: nothing
+more is sent, not even `complete`. A declared path that does not exist in
+the container is logged and skipped.
+
+### `GET /api/jobs/{id}/artifacts?attempt=A`
+
+User endpoint. Lists attempt `A`'s (default: current) artifact rows in
+path order:
+
+```json
+{"attempt": 1, "artifacts": [{"path": "dist/app.bin", "size_bytes": 7,
+ "sha256": "…", "content_type": "application/octet-stream", "created_at": 1700000000000}]}
+```
+
+### `GET /api/jobs/{id}/artifacts/{path}?attempt=A`
+
+Streams one artifact from the store with the row's `Content-Length` and
+`Content-Type`; the `sha256` is the `ETag`. `404` when the job, the
+attempt's row or the object is missing. `quarry artifacts <job>
+[--download dir] [--attempt N]` lists or downloads them; a download is
+verified against the listed `sha256` and written under `dir/<path>`
+(paths that would leave `dir` are refused).
+
+### `GET /api/runs/{id}/source`
+
+Streams the run's workspace bundle (`application/x-tar`) from
+`sources/<run>.tar`, where `POST /api/runs` put the multipart `source`
+part as it arrived. `404` when the run does not exist or was submitted
+without a bundle; the Docker executor then runs the job in an empty
+`/workspace`.
+
 ## Fencing rule
 
 Every runner-side write — heartbeat, log chunk, artifact, completion —

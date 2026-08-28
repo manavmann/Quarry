@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -256,4 +258,30 @@ func TestDockerCleanupLeavesNoContainerOrVolume(t *testing.T) {
 		t.Errorf("failed volume was not kept: %v", err)
 	}
 	assertClean(t, k)
+}
+
+// A directory artifact and a file artifact both land under ArtifactDir
+// without a doubled path segment (CopyFromContainer prefixes entries with
+// the requested basename); a missing declared path is skipped, not fatal.
+func TestDockerArtifactsExtractWithoutDoubledSegment(t *testing.T) {
+	e := newExec(t, Config{})
+	defer assertClean(t, e)
+
+	s := spec("job-art", "mkdir -p dist/sub", "echo -n binary > dist/app.bin", "echo -n x > dist/sub/x.txt", "echo -n top > out.txt")
+	s.Job.Artifacts = []string{"dist", "out.txt", "missing"}
+	s.ArtifactDir = t.TempDir()
+	res, logs, err := run(t, context.Background(), e, s)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("got %+v, %v; want exit 0", res, err)
+	}
+	mustContain(t, logs, "[quarry] artifact missing: not found in container, skipped\n")
+	for p, want := range map[string]string{"dist/app.bin": "binary", "dist/sub/x.txt": "x", "out.txt": "top"} {
+		b, err := os.ReadFile(filepath.Join(s.ArtifactDir, filepath.FromSlash(p)))
+		if err != nil || string(b) != want {
+			t.Errorf("%s = %q, %v; want %q", p, b, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(s.ArtifactDir, "dist", "dist")); err == nil {
+		t.Fatal("doubled path segment dist/dist exists")
+	}
 }

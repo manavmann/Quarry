@@ -193,3 +193,12 @@ func compactJSON(raw json.RawMessage) string {
 	}
 	return s
 }
+
+func renderArtifacts(w io.Writer, arts []Artifact) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "PATH\tSIZE\tSHA256")
+	for _, a := range arts {
+		fmt.Fprintf(tw, "%s\t%d\t%s\n", a.Path, a.SizeBytes, a.SHA256)
+	}
+	tw.Flush()
+}

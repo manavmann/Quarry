@@ -3,11 +3,17 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"quarry/internal/logship"
@@ -245,9 +251,9 @@ func (c *client) completeWithRetry(ctx context.Context, jobID string, req comple
 }
 
 // SourceFetcher returns a function that streams a run's source bundle
-// from GET /api/runs/{id}/source as a tar, for the Docker executor. Until
-// the server serves bundles (C10) the endpoint does not exist; a 404 is
-// reported as "no bundle" (nil, nil) so jobs run in an empty workspace.
+// from GET /api/runs/{id}/source as a tar, for the Docker executor. A 404
+// (the run was submitted without a bundle) is reported as "no bundle"
+// (nil, nil) so the job runs in an empty workspace.
 func SourceFetcher(cfg Config) func(ctx context.Context, runID string) (io.ReadCloser, error) {
 	// Bundles can be large: no client timeout, the job context bounds it.
 	c := &client{base: cfg.ServerURL, token: cfg.Token, http: &http.Client{}}
@@ -276,4 +282,70 @@ func (c *client) source(ctx context.Context, runID string) (io.ReadCloser, error
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, &statusError{Code: resp.StatusCode, Body: string(bytes.TrimSpace(raw))}
 	}
+}
+
+// artifactReply is the 201 body of an artifact upload.
+type artifactReply struct {
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+}
+
+// uploadArtifact streams one file to
+// POST /api/runner/jobs/{id}/attempts/{attempt}/artifacts/{path} with
+// Content-Length set to its size, hashing it as it goes; the server hashes
+// the same stream and a mismatch with its reply is an error. 409 maps to
+// errFenced; other non-2xx replies are *statusError.
+func (c *client) uploadArtifact(ctx context.Context, jobID string, attempt int, path, file string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	url := c.base + "/api/runner/jobs/" + jobID + "/attempts/" + strconv.Itoa(attempt) + "/artifacts/" + escapePath(path)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, io.TeeReader(f, h))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = info.Size()
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	switch {
+	case resp.StatusCode == http.StatusConflict:
+		return errFenced
+	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+		return &statusError{Code: resp.StatusCode, Body: string(bytes.TrimSpace(raw))}
+	}
+	var reply artifactReply
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return fmt.Errorf("decode upload reply: %w", err)
+	}
+	if want := hex.EncodeToString(h.Sum(nil)); reply.SHA256 != want || reply.SizeBytes != info.Size() {
+		return fmt.Errorf("server stored %s as %d bytes sha256 %s, sent %d bytes sha256 %s",
+			path, reply.SizeBytes, reply.SHA256, info.Size(), want)
+	}
+	return nil
+}
+
+// escapePath percent-encodes each segment of a slash path for a URL.
+func escapePath(p string) string {
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
 }

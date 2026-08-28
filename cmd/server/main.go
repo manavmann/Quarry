@@ -3,11 +3,12 @@
 //
 // Configuration is env-only; defaults live in loadConfig:
 //
-//	QUARRY_LISTEN     address to bind            (default :8080)
-//	QUARRY_DB         SQLite database path       (default quarry.db)
-//	QUARRY_API_TOKEN  bearer token for /api/*    (required)
-//	QUARRY_LEASE_TTL  job lease duration          (default 30s)
-//	QUARRY_LOG_CAP    max log bytes per attempt  (default 10485760)
+//	QUARRY_LISTEN        address to bind             (default :8080)
+//	QUARRY_DB            SQLite database path        (default quarry.db)
+//	QUARRY_API_TOKEN     bearer token for /api/*     (required)
+//	QUARRY_LEASE_TTL     job lease duration          (default 30s)
+//	QUARRY_LOG_CAP       max log bytes per attempt   (default 10485760)
+//	QUARRY_ARTIFACT_DIR  local artifact store root   (default quarry-artifacts)
 package main
 
 import (
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"quarry/internal/api"
+	"quarry/internal/artifact/local"
 	"quarry/internal/scheduler"
 	"quarry/internal/store"
 	"quarry/internal/version"
@@ -36,6 +38,7 @@ type config struct {
 	apiToken string
 	leaseTTL time.Duration
 	logCap   int64
+	blobDir  string
 }
 
 func loadConfig() (config, error) {
@@ -45,6 +48,7 @@ func loadConfig() (config, error) {
 		apiToken: os.Getenv("QUARRY_API_TOKEN"),
 		leaseTTL: scheduler.DefaultLeaseTTL,
 		logCap:   scheduler.DefaultLogCapBytes,
+		blobDir:  envOr("QUARRY_ARTIFACT_DIR", "quarry-artifacts"),
 	}
 	if c.apiToken == "" {
 		return c, errors.New("QUARRY_API_TOKEN must be set")
@@ -99,17 +103,22 @@ func run(logger *log.Logger) error {
 		return err
 	}
 	defer st.Close()
+	blobs, err := local.New(cfg.blobDir)
+	if err != nil {
+		return err
+	}
 
 	srv := &http.Server{
 		Addr: cfg.listen,
 		Handler: api.New(st, api.Config{
 			APIToken: cfg.apiToken, Logger: logger, Scheduler: scheduler.Config{LeaseTTL: cfg.leaseTTL, LogCapBytes: cfg.logCap},
+			Artifacts: blobs,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
-	logger.Printf("%s listening on %s (db %s, lease ttl %s)", version.String("server"), cfg.listen, cfg.dbPath, cfg.leaseTTL)
+	logger.Printf("%s listening on %s (db %s, artifacts %s, lease ttl %s)", version.String("server"), cfg.listen, cfg.dbPath, blobs.Root(), cfg.leaseTTL)
 
 	select {
 	case err := <-errc:

@@ -2,6 +2,64 @@
 
 Read this first each session. Newest entry on top.
 
+## C10 · artifact: ArtifactStore, local backend, source bundles, upload/download — done
+
+- Landed: `internal/artifact` (`Store` = `Put(ctx,key,r,size)`/`Get`/
+  `Delete`/`List(prefix)`, `ErrNotFound`, `ValidatePath`/`ValidateKey`
+  rejecting absolute, empty/`.`/`..` segments, backslash and control
+  chars; `SourceKey`/`JobPrefix`/`JobKey` build the only two key shapes)
+  and `artifact/local` (temp file in the destination dir + rename, so a
+  failed reader or crash leaves nothing; `size < 0` = read to EOF for
+  multipart parts). Migration `0004_artifacts` (blueprint §9, PK
+  `(job_id, attempt, path)`); `store/artifacts.go` (`UpsertArtifact`,
+  `GetArtifact`, `ListArtifacts`). `api/artifacts.go`: `POST
+  /api/runner/jobs/{id}/attempts/{attempt}/artifacts/{path...}` —
+  `Content-Length` required (411, 1 GiB cap 413), fence checked before
+  the write, body tee'd into sha256 and streamed to `Put`, then fence +
+  row upsert in one Tx (fence loss → object deleted, 409); `GET
+  /api/jobs/{id}/artifacts[?attempt=]` and `.../artifacts/{path...}`
+  (row's Content-Length/Type, sha256 as ETag); `GET /api/runs/{id}/source`.
+  `handleSubmitRun` mints the run id first and streams the multipart
+  `source` part into `sources/<run>.tar`, discarding it on any failure;
+  `api.Config.Artifacts` is required (panic otherwise). Executor:
+  `JobSpec.ArtifactDir` (agent-owned temp dir the executor fills;
+  `FakeExecutor` `Outcome.Artifacts`); `docker/artifacts.go` copies each
+  declared path after a zero exit, strips the leading tar component
+  (`dist/` → not `dist/dist/`), writes regular files only, skips a
+  missing path with a `[quarry]` line, fails infra otherwise — attach/
+  start/cleanup untouched. Agent: uploads every file with `Content-Length`
+  (retry transport/5xx with the completion backoff) *before* the final log
+  flush and `complete`; compares the reply's sha256/size with its own
+  streamed hash — this detects a mismatch after the upload completes,
+  retries the whole upload, and fails the attempt as infra if it
+  persists; other upload failure → `failed(infra)`; 409 → abort (nothing
+  reported).
+  `cmd/server`: `QUARRY_ARTIFACT_DIR` (default `quarry-artifacts`). CLI
+  `artifacts <job> [--download dir] [--attempt N]` (PATH/SIZE/SHA256; download
+  verifies sha256, temp+rename, refuses paths that leave `dir`). Harness:
+  local store behind `FailArtifactPuts`, `Client.Artifacts/Download`.
+  `docs/protocol.md` gained the four endpoints. Tests: local atomicity
+  (failed reader leaves nothing, previous object survives, size
+  mismatch, ctx), traversal rejected at package/backend/API/CLI; store
+  upsert/list; api upload/list/download/409/404/411/400, source
+  round-trip + orphan cleanup; docker untagged strip/single-file/
+  traversal/symlink + tagged directory artifact; agent uploads-before-
+  complete, retry→infra, 409→abort; harness artifacts listed with sha256
+  and downloadable, store failure → `failed(infra)`; CLI e2e download via
+  the harness. 4× under `-race` clean.
+- Flaky: nothing. `make test-docker` not run this session (daemon down);
+  the tagged test compiles under `go vet -tags docker`.
+- Next: C11.
+known gap: `max_attempts` is still 1, so "store failure → infra retry"
+is terminal `failed(infra)` rather than a requeue; the runner cannot
+send a pre-computed sha256 with `Content-Length` (trailers need chunked
+encoding), so the server hashes the stream and the runner can only
+detect a mismatch after the upload completes (the object and row are
+already stored by then); `artifacts:` entries are paths, not globs (`bin/**` is
+"not found, skipped"); an artifact file and a directory of the same name
+in one attempt is a 500 on the local backend; no per-run artifact
+retention/GC (C16).
+
 ## C09 · cli: quarry run/runs/status/watch/logs/cancel/runners/events — done
 
 - Landed: `internal/cli` (cobra, approved stack; `go.mod` gains

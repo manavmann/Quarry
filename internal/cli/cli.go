@@ -75,7 +75,7 @@ func New(out, err io.Writer) *cobra.Command {
 	pf.DurationVar(&a.interval, "interval", time.Second, "poll interval for watch, logs -f and --wait")
 
 	root.AddCommand(a.runCmd(), a.runsCmd(), a.statusCmd(), a.watchCmd(), a.logsCmd(),
-		a.cancelCmd(), a.runnersCmd(), a.eventsCmd())
+		a.artifactsCmd(), a.cancelCmd(), a.runnersCmd(), a.eventsCmd())
 	return root
 }
 
@@ -403,4 +403,83 @@ func sleep(ctx context.Context, d time.Duration) error {
 	case <-time.After(d):
 		return nil
 	}
+}
+
+// ---- artifacts ---------------------------------------------------------
+
+func (a *App) artifactsCmd() *cobra.Command {
+	var download string
+	var attempt int
+	cmd := &cobra.Command{
+		Use:   "artifacts <job>",
+		Short: "List a job's artifacts; --download writes them under a directory",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			arts, err := a.client.ListArtifacts(ctx, args[0], attempt)
+			if err != nil {
+				return err
+			}
+			if download == "" {
+				renderArtifacts(a.out, arts)
+				return nil
+			}
+			for _, art := range arts {
+				if err := a.downloadArtifact(ctx, args[0], attempt, art, download); err != nil {
+					return err
+				}
+				fmt.Fprintf(a.out, "%s\t%d\n", filepath.Join(download, filepath.FromSlash(art.Path)), art.SizeBytes)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&download, "download", "", "directory to write the artifacts into (created if needed)")
+	cmd.Flags().IntVar(&attempt, "attempt", 0, "attempt to read (default: the job's current attempt)")
+	return cmd
+}
+
+// downloadArtifact streams one artifact to <dir>/<path>, refusing a path
+// that would leave dir and rejecting a body whose sha256 differs from the
+// listing. The file is written to a temp name and renamed into place.
+func (a *App) downloadArtifact(ctx context.Context, jobID string, attempt int, art Artifact, dir string) error {
+	if !safeRelPath(art.Path) {
+		return fmt.Errorf("artifact %q: refusing unsafe path", art.Path)
+	}
+	dst := filepath.Join(dir, filepath.FromSlash(art.Path))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".quarry-dl-*")
+	if err != nil {
+		return err
+	}
+	sum, err := a.client.DownloadArtifact(ctx, jobID, attempt, art.Path, tmp)
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && sum != art.SHA256 {
+		err = fmt.Errorf("artifact %s: sha256 %s, want %s", art.Path, sum, art.SHA256)
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), dst)
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
+}
+
+// safeRelPath reports whether p is a slash-relative path with no empty,
+// "." or ".." segments, so joining it under a directory stays inside it.
+func safeRelPath(p string) bool {
+	if p == "" || strings.HasPrefix(p, "/") || strings.ContainsRune(p, '\\') || strings.ContainsRune(p, 0) {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
 }

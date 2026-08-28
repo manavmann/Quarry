@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -25,6 +27,11 @@ type Outcome struct {
 	Hang bool
 	// LogBytes is how many bytes of output the job writes before ending.
 	LogBytes int
+	// Artifacts are files a successful job leaves in spec.ArtifactDir,
+	// keyed by slash-relative path (e.g. "dist/app.bin"). They are only
+	// written when the job succeeds and the spec names a directory, as
+	// the real executor only collects artifacts after a zero exit.
+	Artifacts map[string]string
 }
 
 // Execution records one Run call.
@@ -103,6 +110,9 @@ func (f *FakeExecutor) Run(ctx context.Context, spec JobSpec, logs io.Writer) (R
 	start := time.Now()
 	res, err := f.run(ctx, o, release, logs)
 	res.Duration = time.Since(start)
+	if err == nil && res.ExitCode == 0 && spec.ArtifactDir != "" {
+		err = writeArtifacts(spec.ArtifactDir, o.Artifacts)
+	}
 
 	f.mu.Lock()
 	f.execs[idx].Err = err
@@ -139,6 +149,20 @@ func (f *FakeExecutor) run(ctx context.Context, o Outcome, release <-chan struct
 		return Result{}, o.Err
 	}
 	return Result{ExitCode: o.ExitCode}, nil
+}
+
+// writeArtifacts lays the scripted files out under dir.
+func writeArtifacts(dir string, files map[string]string) error {
+	for p, body := range files {
+		dst := filepath.Join(dir, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return fmt.Errorf("fake executor: artifact %s: %w", p, err)
+		}
+		if err := os.WriteFile(dst, []byte(body), 0o644); err != nil {
+			return fmt.Errorf("fake executor: artifact %s: %w", p, err)
+		}
+	}
+	return nil
 }
 
 // writeBytes emits n bytes of line-oriented filler.

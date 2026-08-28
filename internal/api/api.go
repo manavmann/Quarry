@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 
+	"quarry/internal/artifact"
 	"quarry/internal/pipeline"
 	"quarry/internal/scheduler"
 	"quarry/internal/store"
@@ -38,22 +39,30 @@ type Config struct {
 	Logger *log.Logger
 	// Scheduler tunes the runner protocol (lease TTL).
 	Scheduler scheduler.Config
+	// Artifacts holds source bundles and job artifacts. Required: the
+	// server is its only writer.
+	Artifacts artifact.Store
 }
 
 // Server serves the user API over a *store.Store.
 type Server struct {
-	st    *store.Store
-	sched *scheduler.Scheduler
-	cfg   Config
-	mux   *http.ServeMux
+	st        *store.Store
+	sched     *scheduler.Scheduler
+	artifacts artifact.Store
+	cfg       Config
+	mux       *http.ServeMux
 }
 
-// New builds a Server whose routes are all registered on a fresh mux.
+// New builds a Server whose routes are all registered on a fresh mux. It
+// panics without an artifact store: there is no meaningful fallback.
 func New(st *store.Store, cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
-	s := &Server{st: st, sched: scheduler.New(st, cfg.Scheduler), cfg: cfg, mux: http.NewServeMux()}
+	if cfg.Artifacts == nil {
+		panic("api: Config.Artifacts is required")
+	}
+	s := &Server{st: st, sched: scheduler.New(st, cfg.Scheduler), artifacts: cfg.Artifacts, cfg: cfg, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	api := http.NewServeMux()
@@ -61,14 +70,18 @@ func New(st *store.Store, cfg Config) *Server {
 	api.HandleFunc("GET /api/runs", s.handleListRuns)
 	api.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
 	api.HandleFunc("GET /api/runs/{id}/events", s.handleListEvents)
+	api.HandleFunc("GET /api/runs/{id}/source", s.handleGetSource)
 	api.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
 	api.HandleFunc("GET /api/jobs/{id}/logs", s.handleGetLogs)
+	api.HandleFunc("GET /api/jobs/{id}/artifacts", s.handleListArtifacts)
+	api.HandleFunc("GET /api/jobs/{id}/artifacts/{path...}", s.handleGetArtifact)
 	api.HandleFunc("GET /api/runners", s.handleListRunners)
 	api.HandleFunc("POST /api/runner/register", s.handleRegister)
 	api.HandleFunc("POST /api/runner/claim", s.handleClaim)
 	api.HandleFunc("POST /api/runner/heartbeat", s.handleHeartbeat)
 	api.HandleFunc("POST /api/runner/jobs/{id}/complete", s.handleComplete)
 	api.HandleFunc("POST /api/runner/jobs/{id}/logs", s.handleAppendLogs)
+	api.HandleFunc("POST /api/runner/jobs/{id}/attempts/{attempt}/artifacts/{path...}", s.handleUploadArtifact)
 	s.mux.Handle("/api/", s.requireToken(api))
 	return s
 }
@@ -125,17 +138,24 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // handleSubmitRun accepts a .quarry.yml document either as the raw request
 // body or as the "pipeline" part of a multipart/form-data upload whose
-// "source" part is the CLI's workspace bundle. The bundle is drained and
-// discarded until C10 stores it and serves it to runners.
+// "source" part is the CLI's workspace bundle. The run id is minted before
+// the body is read so the bundle can stream straight into the artifact
+// store under sources/<run>.tar; if the submission then fails for any
+// reason the bundle is deleted again.
 func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
+	runID := newID(8)
 	var src []byte
 	var err error
+	stored := false
 	if ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); ct == "multipart/form-data" {
-		src, err = readMultipartPipeline(w, r)
+		src, stored, err = s.readMultipartSubmit(w, r, runID)
 	} else {
 		src, err = io.ReadAll(http.MaxBytesReader(w, r.Body, MaxPipelineBytes))
 	}
 	if err != nil {
+		if stored {
+			s.discard(artifact.SourceKey(runID))
+		}
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
 			writeError(w, r, http.StatusRequestEntityTooLarge, fmt.Sprintf("pipeline exceeds %d bytes", MaxPipelineBytes))
@@ -146,34 +166,42 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := pipeline.Parse(src)
 	if err != nil {
+		if stored {
+			s.discard(artifact.SourceKey(runID))
+		}
 		writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	run, jobs, err := submitRun(r.Context(), s.st, p, string(src))
+	run, jobs, err := submitRun(r.Context(), s.st, runID, p, string(src))
 	if err != nil {
+		if stored {
+			s.discard(artifact.SourceKey(runID))
+		}
 		s.internalError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, runDetail(run, jobs))
 }
 
-// readMultipartPipeline returns the "pipeline" part of a multipart submit.
-// The "source" part is drained; any other part is an error. The whole body
-// is bounded by MaxPipelineBytes + MaxSourceBytes.
-func readMultipartPipeline(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+// readMultipartSubmit returns the "pipeline" part of a multipart submit
+// and streams the "source" part, when present, into the artifact store
+// under runID's source key; stored reports whether a bundle was written
+// (even when err is non-nil, so the caller can discard it). Any other part
+// is an error. The whole body is bounded by MaxPipelineBytes +
+// MaxSourceBytes.
+func (s *Server) readMultipartSubmit(w http.ResponseWriter, r *http.Request, runID string) (src []byte, stored bool, err error) {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxPipelineBytes+MaxSourceBytes)
 	mr, err := r.MultipartReader()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	var src []byte
 	for {
 		part, err := mr.NextPart()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, stored, err
 		}
 		switch part.FormName() {
 		case "pipeline":
@@ -182,18 +210,22 @@ func readMultipartPipeline(w http.ResponseWriter, r *http.Request) ([]byte, erro
 				err = &http.MaxBytesError{Limit: MaxPipelineBytes}
 			}
 		case "source":
-			_, err = io.Copy(io.Discard, part)
+			// The part's length is unknown; Put reads it to EOF. A Put
+			// error may still be the body limit (the store surfaces the
+			// reader's error), which the caller maps to 413.
+			err = s.artifacts.Put(r.Context(), artifact.SourceKey(runID), part, -1)
+			stored = true
 		default:
 			err = fmt.Errorf("unexpected multipart field %q", part.FormName())
 		}
 		if err != nil {
-			return nil, err
+			return nil, stored, err
 		}
 	}
 	if src == nil {
-		return nil, errors.New(`multipart body has no "pipeline" part`)
+		return nil, stored, errors.New(`multipart body has no "pipeline" part`)
 	}
-	return src, nil
+	return src, stored, nil
 }
 
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {

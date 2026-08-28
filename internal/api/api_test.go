@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"quarry/internal/artifact/local"
 	"quarry/internal/store"
 )
 
@@ -39,6 +40,13 @@ jobs:
 
 func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()
+	srv, st, _ := newTestServerWithBlobs(t)
+	return srv, st
+}
+
+// newTestServerWithBlobs also returns the server's artifact store.
+func newTestServerWithBlobs(t *testing.T) (*httptest.Server, *store.Store, *local.Store) {
+	t.Helper()
 	var ms int64 = 1_700_000_000_000
 	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "quarry.db"),
 		store.WithClock(func() int64 { ms++; return ms }))
@@ -46,9 +54,13 @@ func newTestServer(t *testing.T) (*httptest.Server, *store.Store) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := httptest.NewServer(New(st, Config{APIToken: testToken, Logger: log.New(io.Discard, "", 0)}))
+	blobs, err := local.New(filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+	srv := httptest.NewServer(New(st, Config{APIToken: testToken, Logger: log.New(io.Discard, "", 0), Artifacts: blobs}))
 	t.Cleanup(srv.Close)
-	return srv, st
+	return srv, st, blobs
 }
 
 // do sends a request with the API token and decodes the JSON body into out

@@ -208,6 +208,14 @@ func (e *Executor) Run(ctx context.Context, spec executor.JobSpec, logs io.Write
 	if info, ierr := e.cli.ContainerInspect(wctx, id); ierr == nil && info.State != nil {
 		res.OOMKilled = info.State.OOMKilled
 	}
+	// Artifacts come out of the exited container before the deferred
+	// removal; a collection failure is an infra error (and keeps the
+	// container when KeepFailed).
+	if res.ExitCode == 0 && spec.ArtifactDir != "" && len(spec.Job.Artifacts) > 0 {
+		if err = e.collectArtifacts(ctx, id, spec, logs); err != nil {
+			return res, orCtx(ctx, err)
+		}
+	}
 	return res, nil
 }
 

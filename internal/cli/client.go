@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -282,4 +285,71 @@ func (c *Client) ListRunners(ctx context.Context) ([]Runner, error) {
 // (cancel is reserved in the protocol); until it lands this is a 404.
 func (c *Client) Cancel(ctx context.Context, runID string) error {
 	return c.do(ctx, http.MethodPost, "/api/runs/"+url.PathEscape(runID)+"/cancel", nil, nil)
+}
+
+// Artifact is one row of GET /api/jobs/{id}/artifacts.
+type Artifact struct {
+	Path        string `json:"path"`
+	SizeBytes   int64  `json:"size_bytes"`
+	SHA256      string `json:"sha256"`
+	ContentType string `json:"content_type"`
+	CreatedAt   int64  `json:"created_at"`
+}
+
+// ListArtifacts returns a job's artifacts; attempt 0 means the current one.
+func (c *Client) ListArtifacts(ctx context.Context, jobID string, attempt int) ([]Artifact, error) {
+	q := url.Values{}
+	if attempt > 0 {
+		q.Set("attempt", strconv.Itoa(attempt))
+	}
+	var out struct {
+		Artifacts []Artifact `json:"artifacts"`
+	}
+	path := "/api/jobs/" + url.PathEscape(jobID) + "/artifacts"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	err := c.do(ctx, http.MethodGet, path, nil, &out)
+	return out.Artifacts, err
+}
+
+// DownloadArtifact streams one artifact into w and returns the sha256 of
+// what was written, computed as it streams. It is a single request: a
+// partial write is not retried, the caller sees the error.
+func (c *Client) DownloadArtifact(ctx context.Context, jobID string, attempt int, path string, w io.Writer) (string, error) {
+	segs := strings.Split(path, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	p := "/api/jobs/" + url.PathEscape(jobID) + "/artifacts/" + strings.Join(segs, "/")
+	if attempt > 0 {
+		p += "?attempt=" + strconv.Itoa(attempt)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+p, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		e := &APIError{Status: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
+		var msg struct {
+			Error     string `json:"error"`
+			RequestID string `json:"request_id"`
+		}
+		if json.Unmarshal(raw, &msg) == nil && msg.Error != "" {
+			e.Message, e.RequestID = msg.Error, msg.RequestID
+		}
+		return "", e
+	}
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(w, h), resp.Body); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

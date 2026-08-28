@@ -38,10 +38,10 @@ func TestMigrateFreshDB(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	v, err := s.SchemaVersion(ctx)
-	if err != nil || v != 3 {
-		t.Fatalf("SchemaVersion = %d, %v; want 3", v, err)
+	if err != nil || v != 4 {
+		t.Fatalf("SchemaVersion = %d, %v; want 4", v, err)
 	}
-	for _, tbl := range []string{"runs", "jobs", "job_deps", "runners", "events", "log_chunks"} {
+	for _, tbl := range []string{"runs", "jobs", "job_deps", "runners", "events", "log_chunks", "artifacts"} {
 		var n int
 		if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, tbl).Scan(&n); err != nil || n != 1 {
 			t.Errorf("table %s missing (n=%d, err=%v)", tbl, n, err)
@@ -64,8 +64,8 @@ func TestMigrateFreshDB(t *testing.T) {
 	}
 	defer s.Close()
 	var applied int
-	if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil || applied != 3 {
-		t.Fatalf("schema_migrations rows = %d, %v; want 3", applied, err)
+	if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil || applied != 4 {
+		t.Fatalf("schema_migrations rows = %d, %v; want 4", applied, err)
 	}
 }
 
@@ -397,5 +397,43 @@ func TestHasJobEvent(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Errorf("HasJobEvent(%s, %d) = %v, %v; want %v", tc.typ, tc.attempt, got, err, tc.want)
 		}
+	}
+}
+
+func TestArtifactsUpsertListGet(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	jobs := []Job{{ID: "j1", Name: "a", SpecJSON: []byte(`{}`)}}
+	if err := s.Tx(ctx, func(tx *sql.Tx) error { return s.CreateRun(ctx, tx, newRun("r1"), jobs, nil) }); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	put := func(a Artifact) {
+		t.Helper()
+		if err := s.Tx(ctx, func(tx *sql.Tx) error { return s.UpsertArtifact(ctx, tx, &a) }); err != nil {
+			t.Fatalf("UpsertArtifact: %v", err)
+		}
+	}
+	put(Artifact{JobID: "j1", Attempt: 1, Path: "dist/b.bin", SizeBytes: 2, SHA256: "bb", ContentType: "application/octet-stream"})
+	put(Artifact{JobID: "j1", Attempt: 1, Path: "dist/a.bin", SizeBytes: 1, SHA256: "aa", ContentType: "application/octet-stream"})
+	put(Artifact{JobID: "j1", Attempt: 2, Path: "other", SizeBytes: 9, SHA256: "cc", ContentType: "text/plain"})
+	// Redelivery replaces the row rather than failing on the primary key.
+	put(Artifact{JobID: "j1", Attempt: 1, Path: "dist/a.bin", SizeBytes: 3, SHA256: "aa2", ContentType: "application/octet-stream"})
+
+	got, err := s.ListArtifacts(ctx, s.Reader(), "j1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Path != "dist/a.bin" || got[1].Path != "dist/b.bin" {
+		t.Fatalf("ListArtifacts = %+v", got)
+	}
+	if got[0].SizeBytes != 3 || got[0].SHA256 != "aa2" || got[0].CreatedAt == 0 {
+		t.Fatalf("redelivered row = %+v", got[0])
+	}
+	a, err := s.GetArtifact(ctx, s.Reader(), "j1", 2, "other")
+	if err != nil || a.ContentType != "text/plain" {
+		t.Fatalf("GetArtifact = %+v, %v", a, err)
+	}
+	if _, err := s.GetArtifact(ctx, s.Reader(), "j1", 3, "other"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetArtifact missing = %v", err)
 	}
 }

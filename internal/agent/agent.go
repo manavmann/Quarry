@@ -13,9 +13,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"math/rand/v2"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -298,6 +302,18 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 		return
 	}
 	spec := executor.JobSpec{JobID: job.ID, RunID: job.RunID, Attempt: job.Attempt, Job: pj}
+	if len(pj.Artifacts) > 0 {
+		// The executor fills this directory on success; it is uploaded
+		// from and removed here, whatever happens.
+		dir, err := os.MkdirTemp("", "quarry-artifacts-")
+		if err != nil {
+			logger.Printf("job %s attempt %d: %v", job.ID, job.Attempt, err)
+			a.report(job, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: "artifact dir: " + err.Error()})
+			return
+		}
+		defer os.RemoveAll(dir)
+		spec.ArtifactDir = dir
+	}
 
 	ectx := jctx
 	if pj.Timeout > 0 {
@@ -314,6 +330,21 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 		OnStale: func() { cancel(errAbort) },
 	}, a.logSink(job))
 	res, execErr := a.exec.Run(ectx, spec, shipper)
+
+	// Artifacts go up before the verdict is fixed and before complete,
+	// while the attempt is still the running one; every upload carries the
+	// attempt and is fenced like a log chunk. A failed upload fails the
+	// attempt as infra (or as whatever ended the context meanwhile), and a
+	// 409 means the attempt was superseded: it is aborted like a stale log
+	// batch would abort it.
+	if execErr == nil && res.ExitCode == 0 && spec.ArtifactDir != "" {
+		if err := a.uploadArtifacts(ectx, job, spec.ArtifactDir, shipper); err != nil {
+			if errors.Is(err, errFenced) {
+				cancel(errAbort)
+			}
+			execErr = fmt.Errorf("upload artifacts: %w", err)
+		}
+	}
 
 	// The verdict is fixed here, before the final flush: whatever the
 	// shipper learns from now on (a 409 on the tail, say) belongs to a
@@ -434,6 +465,48 @@ func (a *Agent) apply(d directive) {
 	if cancel != nil {
 		cancel(cause)
 	}
+}
+
+// uploadArtifacts posts every regular file under dir as an artifact of
+// job's attempt, one request per file with Content-Length set, in lexical
+// path order. Transport errors and 5xx replies are retried with the
+// completion backoff; a 409 (errFenced) and other 4xx are final. One line
+// per file goes to logs so the job's output records what was kept.
+func (a *Agent) uploadArtifacts(ctx context.Context, job *claimedJob, dir string, logs io.Writer) error {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		path := filepath.ToSlash(rel)
+		backoff := a.cfg.CompleteBackoff
+		for i := 0; ; i++ {
+			err = a.client.uploadArtifact(ctx, job.ID, job.Attempt, path, p)
+			var se *statusError
+			if err == nil || errors.Is(err, errFenced) || (errors.As(err, &se) && !se.Retryable()) || ctx.Err() != nil || i+1 >= a.cfg.CompleteRetries {
+				break
+			}
+			if !a.wait(ctx, backoff) {
+				break
+			}
+			if backoff *= 2; backoff > maxCompleteBackoff {
+				backoff = maxCompleteBackoff
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			fmt.Fprintf(logs, "[quarry] uploaded artifact %s (%d bytes)\n", path, info.Size())
+		}
+		return nil
+	})
 }
 
 // logSink is the shipper's delivery function for one attempt: each batch
