@@ -2,6 +2,40 @@
 
 Read this first each session. Newest entry on top.
 
+## C11 · deploy: compose cluster, images, example pipeline, demo script v1 — done
+
+- Landed: `deploy/server.Dockerfile` + `deploy/runner.Dockerfile`
+  (multi-stage, `golang:1.27-alpine` → `alpine:3.20`, `CGO_ENABLED=0`,
+  version via `ARG VERSION`; server runs as `quarry` with
+  `/var/lib/quarry` as the DB + artifact volume, runner runs as root for
+  the socket), `deploy/docker-compose.yml` (server on named volume
+  `quarry-data`, `/healthz` healthcheck; runner-1..3 with
+  `os=linux,pool=build|test|test`, socket mount, healthcheck = "name
+  appears in `GET /api/runners`", `depends_on: service_healthy`; token
+  `QUARRY_API_TOKEN` default `dev-token`), root `.dockerignore`,
+  `examples/go-app` (stdlib word counter with tests; `.quarry.yml`:
+  build → [test, lint] → package, `artifacts: [dist]`, `labels: {os:
+  linux}`), `scripts/demo.sh` (build CLI, `up --build --wait`, pre-pull
+  job image, `run`, `watch`, list package artifacts via curl+sed on the
+  run JSON, `down [-v]`), README quickstart, `docs/architecture.md`
+  first draft, `docs/design-decisions.md` (DooD, volume-per-attempt,
+  SQLite single-writer, attach-before-start, `(state, attempt)` fence,
+  run.sh per job). CI gained a `compose` job: `up --wait`, `timeout 120
+  quarry run --wait` on a cold cache, 4/4 healthy, `demo.sh` end to end,
+  no leftover `quarry.job` containers/`quarry-*` volumes, `down -v`.
+  Verified locally on Windows Docker Desktop: demo 45 s wall including
+  build+up; cold-cache `run --wait` 24 s (runner pulled the image inside
+  `build`); run survives `compose restart server`. Nothing under
+  `internal/` changed.
+- Flaky: nothing. macOS not verified this session (no machine); CI covers
+  Linux only — GitHub macOS runners have no Docker.
+- Next: C12.
+known gap: no `quarry` CLI image (demo needs Go on the host); runner
+healthcheck only proves registration, not that it can reach the daemon;
+compose has no `QUARRY_LOG_CAP`/`QUARRY_KEEP_FAILED` knobs exposed; job id
+for `artifacts` still has to be scraped from the run JSON (status table
+shows names only).
+
 ## C10 · artifact: ArtifactStore, local backend, source bundles, upload/download — done
 
 - Landed: `internal/artifact` (`Store` = `Put(ctx,key,r,size)`/`Get`/

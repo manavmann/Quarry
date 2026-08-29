@@ -1,0 +1,84 @@
+# Quarry demo cluster: one control plane + three Docker-executor runners.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build --wait
+#   QUARRY_TOKEN=dev-token quarry run --wait -C examples/go-app
+#
+# Default profile has no external dependencies: SQLite and the local
+# artifact store live in the `quarry-data` named volume. Override the
+# token with QUARRY_API_TOKEN in the environment or a deploy/.env file.
+
+x-runner: &runner
+  build:
+    context: ..
+    dockerfile: deploy/runner.Dockerfile
+    args: { VERSION: "${QUARRY_VERSION:-dev}" }
+  image: quarry-runner:${QUARRY_VERSION:-dev}
+  restart: unless-stopped
+  environment: &runner-env
+    QUARRY_SERVER: http://server:8080
+    QUARRY_API_TOKEN: ${QUARRY_API_TOKEN:-dev-token}
+    QUARRY_EXECUTOR: docker
+    QUARRY_CAPACITY: "2"
+  volumes:
+    # Docker-out-of-Docker: job containers are siblings on the host daemon.
+    - /var/run/docker.sock:/var/run/docker.sock
+  depends_on:
+    server:
+      condition: service_healthy
+  # Healthy once the runner has registered itself with the control plane.
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - >-
+        wget -qO- --header "Authorization: Bearer $$QUARRY_API_TOKEN"
+        http://server:8080/api/runners | grep -q "\"$$QUARRY_RUNNER_NAME\""
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 5s
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+      args: { VERSION: "${QUARRY_VERSION:-dev}" }
+    image: quarry-server:${QUARRY_VERSION:-dev}
+    restart: unless-stopped
+    ports:
+      - "${QUARRY_PORT:-8080}:8080"
+    environment:
+      QUARRY_API_TOKEN: ${QUARRY_API_TOKEN:-dev-token}
+      QUARRY_LEASE_TTL: ${QUARRY_LEASE_TTL:-30s}
+    volumes:
+      - quarry-data:/var/lib/quarry
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+
+  runner-1:
+    <<: *runner
+    environment:
+      <<: *runner-env
+      QUARRY_RUNNER_NAME: runner-1
+      QUARRY_LABELS: os=linux,pool=build
+
+  runner-2:
+    <<: *runner
+    environment:
+      <<: *runner-env
+      QUARRY_RUNNER_NAME: runner-2
+      QUARRY_LABELS: os=linux,pool=test
+
+  runner-3:
+    <<: *runner
+    environment:
+      <<: *runner-env
+      QUARRY_RUNNER_NAME: runner-3
+      QUARRY_LABELS: os=linux,pool=test
+
+volumes:
+  quarry-data:

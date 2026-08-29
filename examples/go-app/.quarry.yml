@@ -1,0 +1,37 @@
+# Example pipeline: build -> [test, lint] -> package.
+# Every job runs in its own golang container against a fresh copy of this
+# directory; `package` publishes dist/ as an artifact.
+name: go-app
+jobs:
+  - name: build
+    image: golang:1.27-alpine
+    labels: { os: linux }
+    steps:
+      - go version
+      - go build ./...
+
+  - name: test
+    image: golang:1.27-alpine
+    labels: { os: linux }
+    needs: [build]
+    steps:
+      - go test -v ./...
+
+  - name: lint
+    image: golang:1.27-alpine
+    labels: { os: linux }
+    needs: [build]
+    steps:
+      - test -z "$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
+      - go vet ./...
+
+  - name: package
+    image: golang:1.27-alpine
+    labels: { os: linux }
+    needs: [test, lint]
+    steps:
+      - mkdir -p dist
+      - CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/go-app .
+      - echo "hello quarry hello world" | ./dist/go-app
+    artifacts:
+      - dist

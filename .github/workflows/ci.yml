@@ -24,3 +24,35 @@ jobs:
           go-version-file: go.mod
       - run: go test -race ./...
       - run: make build
+
+  # C11: fresh clone -> docker compose up -> quarry run --wait in < 2 min
+  # on a cold image cache, then the demo script end to end.
+  compose:
+    runs-on: ubuntu-latest
+    env:
+      QUARRY_TOKEN: dev-token
+      QUARRY_SERVER: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: docker compose -f deploy/docker-compose.yml up -d --build --wait
+      - run: go build -o bin/quarry ./cmd/quarry
+      - name: quarry run --wait (cold cache, 2 min budget)
+        run: timeout 120 bin/quarry run --wait -C examples/go-app
+      - name: runners are registered and healthy
+        run: |
+          bin/quarry runners
+          docker compose -f deploy/docker-compose.yml ps --format '{{.Name}} {{.Health}}'
+          test "$(docker compose -f deploy/docker-compose.yml ps --format '{{.Health}}' | grep -c healthy)" = 4
+      - name: demo script end to end
+        run: timeout 300 scripts/demo.sh
+      - name: no job containers or volumes left behind
+        run: |
+          test "$(docker ps -aq --filter label=quarry.job | wc -l)" = 0
+          test "$(docker volume ls -q | grep -c '^quarry-' || true)" = 0
+      - if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs --tail 100
+      - if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v

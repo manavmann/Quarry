@@ -1,0 +1,12 @@
+# Docker build context for deploy/*.Dockerfile (context = repo root).
+.git
+bin/
+spike/
+web/
+docs/
+deploy/
+examples/
+scripts/
+*.db
+*.db-*
+quarry-artifacts/
