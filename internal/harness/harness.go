@@ -5,7 +5,8 @@
 // sleeps for a fixed time.
 //
 // Goroutines: each agent's Run loop is owned by the Harness and stopped in
-// t.Cleanup (or by Kill); the server's are owned by httptest.Server.
+// t.Cleanup (or by Kill); the lease monitor is owned by the Harness and
+// stopped in close; the server's are owned by httptest.Server.
 package harness
 
 import (
@@ -54,6 +55,14 @@ type Opts struct {
 	// CompleteBackoff is the runner's first completion retry delay.
 	// Default 5ms.
 	CompleteBackoff time.Duration
+	// MaxAttempts is the retry cap stamped on every job. Default 3.
+	MaxAttempts int
+	// MonitorInterval paces the lease monitor. Default 10ms; expiry still
+	// needs the fake clock advanced past LeaseTTL.
+	MonitorInterval time.Duration
+	// RunnerOfflineAfter is the silence after which a runner is offline.
+	// Default 30s of fake time.
+	RunnerOfflineAfter time.Duration
 }
 
 // Harness is a running server plus its agents. Methods must be called
@@ -70,6 +79,10 @@ type Harness struct {
 	blobs *faultStore
 	execs []*executor.FakeExecutor
 	ags   []*runner
+	// The lease monitor goroutine is owned by the Harness: started in New,
+	// stopped in close before the server.
+	stopMon context.CancelFunc
+	monDone <-chan struct{}
 }
 
 // runner is one agent and the harness state around it. exec and name
@@ -78,6 +91,7 @@ type Harness struct {
 type runner struct {
 	name  string
 	exec  *executor.FakeExecutor
+	net   *agentTransport
 	agent *agent.Agent
 	stop  context.CancelFunc
 	done  <-chan struct{}
@@ -115,6 +129,9 @@ func New(t *testing.T, opts Opts) *Harness {
 	if opts.CompleteBackoff == 0 {
 		opts.CompleteBackoff = 5 * time.Millisecond
 	}
+	if opts.MonitorInterval == 0 {
+		opts.MonitorInterval = 10 * time.Millisecond
+	}
 	h := &Harness{
 		t: t, opts: opts, log: log.New(io.Discard, "", 0),
 		clock: &Clock{}, http: &http.Client{Timeout: 10 * time.Second},
@@ -135,9 +152,21 @@ func New(t *testing.T, opts Opts) *Harness {
 		t.Fatalf("harness: open artifact store: %v", err)
 	}
 	h.blobs = &faultStore{Store: blobs}
-	h.srv = httptest.NewServer(api.New(st, api.Config{
-		APIToken: Token, Logger: h.log, Scheduler: scheduler.Config{LeaseTTL: opts.LeaseTTL}, Artifacts: h.blobs,
-	}))
+	srv := api.New(st, api.Config{
+		APIToken: Token, Logger: h.log, Artifacts: h.blobs,
+		Scheduler: scheduler.Config{
+			LeaseTTL: opts.LeaseTTL, MaxAttempts: opts.MaxAttempts,
+			MonitorInterval: opts.MonitorInterval, RunnerOfflineAfter: opts.RunnerOfflineAfter,
+		},
+	})
+	h.srv = httptest.NewServer(srv)
+	mctx, stopMon := context.WithCancel(context.Background())
+	monDone := make(chan struct{})
+	h.stopMon, h.monDone = stopMon, monDone
+	go func() {
+		defer close(monDone)
+		srv.RunMonitor(mctx)
+	}()
 	WaitFor(t, func() bool {
 		resp, err := h.http.Get(h.srv.URL + "/healthz")
 		if err != nil {
@@ -148,7 +177,7 @@ func New(t *testing.T, opts Opts) *Harness {
 	}, "server healthy")
 
 	for i := 0; i < opts.Agents; i++ {
-		r := &runner{name: "agent-" + strconv.Itoa(i), exec: executor.NewFake()}
+		r := &runner{name: "agent-" + strconv.Itoa(i), exec: executor.NewFake(), net: &agentTransport{}}
 		h.ags = append(h.ags, r)
 		h.execs = append(h.execs, r.exec)
 		h.startAgent(i)
@@ -157,10 +186,14 @@ func New(t *testing.T, opts Opts) *Harness {
 }
 
 // close stops agents first so nothing is mid-request when the server
-// goes, then the server, then the store.
+// goes, then the monitor, then the server, then the store.
 func (h *Harness) close() {
 	for i := range h.ags {
 		h.stopAgent(i)
+	}
+	if h.stopMon != nil {
+		h.stopMon()
+		<-h.monDone
 	}
 	if h.srv != nil {
 		h.srv.Close()
@@ -183,7 +216,8 @@ func (h *Harness) startAgent(i int) {
 		ServerURL: h.srv.URL, Token: Token, Name: r.name, Labels: labels,
 		Capacity: h.opts.Capacity, Version: "harness",
 		PollInterval: h.opts.PollInterval, HeartbeatInterval: h.opts.HeartbeatInterval,
-		CompleteBackoff: h.opts.CompleteBackoff, Logger: h.log, HTTPClient: h.http,
+		CompleteBackoff: h.opts.CompleteBackoff, Logger: h.log,
+		HTTPClient: &http.Client{Timeout: h.http.Timeout, Transport: r.net},
 	}, r.exec)
 	if err != nil {
 		h.t.Fatalf("harness: agent %d: %v", i, err)
@@ -222,6 +256,25 @@ func (h *Harness) Restart(i int) {
 		h.t.Fatalf("Restart(%d): agent is running", i)
 	}
 	h.startAgent(i)
+}
+
+// MuteHeartbeats makes agent i's heartbeat requests fail at the transport
+// (or lets them through again): the runner keeps executing, but its
+// leases stop being extended, as with a partitioned or wedged runner.
+func (h *Harness) MuteHeartbeats(i int, mute bool) { h.ags[i].net.muteHB.Store(mute) }
+
+// agentTransport is one agent's network path to the server. It drops
+// heartbeats while muteHB is set; everything else goes through the
+// default transport.
+type agentTransport struct{ muteHB atomic.Bool }
+
+var errMuted = errors.New("harness: heartbeat dropped")
+
+func (t *agentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.muteHB.Load() && strings.HasSuffix(req.URL.Path, "/api/runner/heartbeat") {
+		return nil, errMuted
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // AgentName is the name agent i registers with.
@@ -402,6 +455,25 @@ func (c *Client) Logs(id string, after int64) (*Logs, error) {
 		return nil, err
 	}
 	return &l, nil
+}
+
+// Runner is one row of GET /api/runners.
+type Runner struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	State      string `json:"state"`
+	LastSeenAt int64  `json:"last_seen_at"`
+}
+
+// Runners lists every registered runner.
+func (c *Client) Runners() ([]Runner, error) {
+	var reply struct {
+		Runners []Runner `json:"runners"`
+	}
+	if err := c.do(http.MethodGet, "/api/runners", "", &reply); err != nil {
+		return nil, err
+	}
+	return reply.Runners, nil
 }
 
 // Events lists a run's events in id order.

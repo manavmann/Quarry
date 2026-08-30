@@ -7,6 +7,8 @@
 //	QUARRY_DB            SQLite database path        (default quarry.db)
 //	QUARRY_API_TOKEN     bearer token for /api/*     (required)
 //	QUARRY_LEASE_TTL     job lease duration          (default 30s)
+//	QUARRY_MAX_ATTEMPTS  claims per job before an infra/lost_runner
+//	                     failure is terminal         (default 3)
 //	QUARRY_LOG_CAP       max log bytes per attempt   (default 10485760)
 //	QUARRY_ARTIFACT_DIR  local artifact store root   (default quarry-artifacts)
 package main
@@ -37,6 +39,7 @@ type config struct {
 	dbPath   string
 	apiToken string
 	leaseTTL time.Duration
+	maxAtt   int
 	logCap   int64
 	blobDir  string
 }
@@ -47,6 +50,7 @@ func loadConfig() (config, error) {
 		dbPath:   envOr("QUARRY_DB", "quarry.db"),
 		apiToken: os.Getenv("QUARRY_API_TOKEN"),
 		leaseTTL: scheduler.DefaultLeaseTTL,
+		maxAtt:   scheduler.DefaultMaxAttempts,
 		logCap:   scheduler.DefaultLogCapBytes,
 		blobDir:  envOr("QUARRY_ARTIFACT_DIR", "quarry-artifacts"),
 	}
@@ -59,6 +63,13 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("QUARRY_LEASE_TTL: %q is not a positive duration", v)
 		}
 		c.leaseTTL = d
+	}
+	if v := os.Getenv("QUARRY_MAX_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return c, fmt.Errorf("QUARRY_MAX_ATTEMPTS: %q is not a positive integer", v)
+		}
+		c.maxAtt = n
 	}
 	if v := os.Getenv("QUARRY_LOG_CAP"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -88,8 +99,9 @@ func main() {
 	}
 }
 
-// run owns every goroutine the server starts: the listener below and the
-// signal watcher inside signal.NotifyContext. Both end before run returns.
+// run owns every goroutine the server starts: the listener and the lease
+// monitor below and the signal watcher inside signal.NotifyContext. All
+// end before run returns.
 func run(logger *log.Logger) error {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -108,17 +120,22 @@ func run(logger *log.Logger) error {
 		return err
 	}
 
-	srv := &http.Server{
-		Addr: cfg.listen,
-		Handler: api.New(st, api.Config{
-			APIToken: cfg.apiToken, Logger: logger, Scheduler: scheduler.Config{LeaseTTL: cfg.leaseTTL, LogCapBytes: cfg.logCap},
-			Artifacts: blobs,
-		}),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	h := api.New(st, api.Config{
+		APIToken: cfg.apiToken, Logger: logger,
+		Scheduler: scheduler.Config{LeaseTTL: cfg.leaseTTL, LogCapBytes: cfg.logCap, MaxAttempts: cfg.maxAtt},
+		Artifacts: blobs,
+	})
+	srv := &http.Server{Addr: cfg.listen, Handler: h, ReadHeaderTimeout: 10 * time.Second}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
-	logger.Printf("%s listening on %s (db %s, artifacts %s, lease ttl %s)", version.String("server"), cfg.listen, cfg.dbPath, blobs.Root(), cfg.leaseTTL)
+	// The lease monitor stops with ctx; wait for it before the store closes.
+	monDone := make(chan struct{})
+	go func() {
+		defer close(monDone)
+		h.RunMonitor(ctx)
+	}()
+	defer func() { stop(); <-monDone }()
+	logger.Printf("%s listening on %s (db %s, artifacts %s, lease ttl %s, max attempts %d)", version.String("server"), cfg.listen, cfg.dbPath, blobs.Root(), cfg.leaseTTL, cfg.maxAtt)
 
 	select {
 	case err := <-errc:

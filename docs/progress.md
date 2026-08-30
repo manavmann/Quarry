@@ -2,6 +2,50 @@
 
 Read this first each session. Newest entry on top.
 
+## C12 · scheduler: lease monitor, infra-failure retries, runner offline detection — done
+
+- Landed: `scheduler.Config` gains `MaxAttempts` (default 3),
+  `MonitorInterval` (5 s), `RunnerOfflineAfter` (30 s); `retryable(kind)`
+  is the single retry-eligibility decision (`infra|lost_runner`) and
+  `Complete` uses it — claim logic untouched. `scheduler/monitor.go`:
+  `Tick` = one Tx (expired leases → `RequeueJob` + `job.requeued
+  {failure_kind: lost_runner, runner_id}` below `max_attempts`, else
+  `FinishJob(failed, lost_runner)` + `job.failed` + `advance`; then
+  `MarkRunnersOffline(now-30s)`), returns a `TickReport`; `RunMonitor(ctx,
+  logger)` paces ticks with a ticker but reads time only from the store
+  clock. Store: `ListExpiredLeases`, `MarkRunnersOffline` (no migration).
+  `api.submitRun` stamps `sched.MaxAttempts()` instead of 1;
+  `Server.RunMonitor(ctx)`; `cmd/server`: `QUARRY_MAX_ATTEMPTS`, monitor
+  goroutine owned by `run()` and stopped before the store closes. Harness:
+  per-agent transport with `MuteHeartbeats(i, bool)`, `Opts.MaxAttempts/
+  MonitorInterval/RunnerOfflineAfter` (monitor at 10 ms, fake clock),
+  `Client.Runners()`. Tests: scheduler `retryable` table + `lost_runner`
+  rejected from runners, requeue + idempotent tick + stale complete
+  `ErrFenced` + heartbeat `abort` + reclaim as attempt 2, exhaustion
+  cascade with a sibling kept alive by heartbeats, offline once + back on
+  contact; harness `TestLostRunnerJobIsReassigned` (mute → clock +31 s →
+  other runner succeeds, lost runner `offline`, HTTP stale complete 409),
+  `TestLostRunnerExhaustsAttempts`, `TestSilentRunnerGoesOffline`,
+  `TestExitCodeFailureIsNeverRetried`. Re-verified C10's
+  `TestArtifactStoreFailureIsInfra` and C06's `TestInfraFailureIsReported`/
+  `TestKillAndRestartAgent`: they asserted terminal `failed(infra)` on
+  attempt 1 because `max_attempts` was 1 — now they assert the requeue
+  (kill → `queued`, same runner finishes attempt 2) and terminal failure
+  at attempt 3 (2 for the artifact test) with `job.requeued` events.
+  `docs/failure-model.md` draft, protocol/architecture updated. Compose
+  verified: `docker compose kill runner-2` 8 s into a 45 s job → requeued
+  as `lost_runner` at +39 s, `runner-3` ran attempt 2, run succeeded,
+  `runner-2` shows `offline`. 4× under `-race` clean.
+- Flaky: nothing.
+- Next: C13.
+known gap: the SIGKILLed runner's job container + volume
+(`quarry-<job>-1`) are orphaned on the host until C16's reaper (cleaned by
+hand this session); no `runner.offline`/`runner.online` events (events
+are per run); `MonitorInterval`/`RunnerOfflineAfter` have no env vars;
+`quarry status` shows `lost_runner` only via `failed (lost_runner)`, the
+requeue is visible in `events` only; reassignment latency is TTL + tick +
+poll (~36 s with defaults), not tunable below the 5 s tick.
+
 ## C11 · deploy: compose cluster, images, example pipeline, demo script v1 — done
 
 - Landed: `deploy/server.Dockerfile` + `deploy/runner.Dockerfile`

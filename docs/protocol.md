@@ -256,11 +256,18 @@ and forgets the attempt.
 - `max_attempts` bounds the number of claims. Only `infra` and
   `lost_runner` failures retry; `exit_code`, `timeout` and `cancelled` do
   not — a failing test is not flakiness the platform should hide.
+- `max_attempts` is `QUARRY_MAX_ATTEMPTS` (default `3`), stamped on every
+  job at submission.
 - Lease TTL is `QUARRY_LEASE_TTL` (default `30s`); runners heartbeat every
-  5 s, so ~6 missed heartbeats precede reassignment. Expiry itself is the
-  lease monitor's job (C07): running jobs past `lease_expires_at` go back
-  to `queued` (or `failed(lost_runner)` at the attempt cap) and the next
-  claim increments `attempt`.
+  5 s, so ~6 missed heartbeats precede reassignment. Expiry is the lease
+  monitor's job: every 5 s, in one transaction, it moves running jobs
+  whose `lease_expires_at` is in the past back to `queued` (event
+  `job.requeued` with `failure_kind: lost_runner`), or to
+  `failed(lost_runner)` at the attempt cap with the usual DAG cascade, and
+  marks runners silent for 30 s `offline` (any later contact makes them
+  `online` again). The next claim increments `attempt`. A tick is
+  idempotent and reads only the store's clock. `docs/failure-model.md`
+  walks through what each failure looks like.
 
 ## Execution semantics
 

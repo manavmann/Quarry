@@ -57,11 +57,17 @@ starting another runner process with the same token.
    container; the agent uploads them, flushes the last logs, then sends
    `complete`. The server fences the write on `(running, attempt)`,
    applies the terminal state (or requeues an `infra` failure below
-   `max_attempts`), advances the DAG (`pending` → `queued` or `skipped`)
+   `max_attempts`, default 3), advances the DAG (`pending` → `queued` or `skipped`)
    and finalises the run — all in one transaction, so a dependent is
    queued exactly once.
 5. `quarry watch` polls `GET /api/runs/{id}` and redraws the job table in
    DAG order until the run is terminal.
+
+If a runner dies mid-job its heartbeats stop; the lease monitor (a 5 s
+tick on the server, fake clock in tests) requeues the job once the lease
+is 30 s stale and another runner picks it up as the next attempt. The
+dead runner's late writes fail the `(running, attempt)` fence. See
+`docs/failure-model.md`.
 
 ## Where state lives
 
@@ -91,5 +97,5 @@ only when the fleet can take work.
 
 ## Not yet
 
-Lease expiry / `lost_runner` monitor, the `quarry cancel` server path,
-`/metrics`, artifact retention, `web/`. Tracked in `docs/progress.md`.
+The `quarry cancel` server path, `/metrics`, artifact retention, `web/`.
+Tracked in `docs/progress.md`.

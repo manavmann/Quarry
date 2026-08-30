@@ -17,11 +17,12 @@ const TriggerAPI = "api"
 // one transaction: the run (pending), one job per pipeline job, the
 // dependency edges, and a run.created event. Root jobs are inserted as
 // queued so a runner can claim them immediately; every other job waits as
-// pending until the scheduler (C05) advances the DAG.
+// pending until the scheduler advances the DAG. maxAttempts is the
+// scheduler-wide retry cap stamped on every job.
 //
 // This is deliberately not an HTTP handler: it is the only piece of
 // submission logic in the package and the scheduler may later own it.
-func submitRun(ctx context.Context, st *store.Store, runID string, p *pipeline.Pipeline, src string) (*store.Run, []store.Job, error) {
+func submitRun(ctx context.Context, st *store.Store, runID string, p *pipeline.Pipeline, src string, maxAttempts int) (*store.Run, []store.Job, error) {
 	run := &store.Run{
 		ID:           runID,
 		PipelineYAML: src,
@@ -47,7 +48,7 @@ func submitRun(ctx context.Context, st *store.Store, runID string, p *pipeline.P
 		if roots[pj.Name] {
 			state = store.JobQueued
 		}
-		jobs = append(jobs, store.Job{ID: id, Name: pj.Name, SpecJSON: spec, State: state, MaxAttempts: 1})
+		jobs = append(jobs, store.Job{ID: id, Name: pj.Name, SpecJSON: spec, State: state, MaxAttempts: maxAttempts})
 	}
 	for i := range p.Jobs {
 		pj := &p.Jobs[i]

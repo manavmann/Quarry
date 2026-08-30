@@ -27,6 +27,17 @@ const DefaultLeaseTTL = 30 * time.Second
 // truncated and a job.logs_truncated event is recorded once.
 const DefaultLogCapBytes = 10 << 20
 
+// DefaultMaxAttempts is how many claims a job gets before an infra or
+// lost_runner failure becomes terminal (blueprint §13).
+const DefaultMaxAttempts = 3
+
+// DefaultMonitorInterval is how often the lease monitor ticks.
+const DefaultMonitorInterval = 5 * time.Second
+
+// DefaultRunnerOfflineAfter is how long a runner may stay silent before
+// the monitor marks it offline.
+const DefaultRunnerOfflineAfter = 30 * time.Second
+
 // ErrFenced is returned when a runner-side write fails the
 // (state='running', attempt) check: the attempt is stale, the job was
 // requeued, or it is not running. Callers map it to 409.
@@ -50,13 +61,22 @@ const (
 type Config struct {
 	LeaseTTL    time.Duration
 	LogCapBytes int64
+	// MaxAttempts is stamped on every job at submission and bounds retries.
+	MaxAttempts int
+	// MonitorInterval paces RunMonitor's ticks.
+	MonitorInterval time.Duration
+	// RunnerOfflineAfter is the silence after which a runner is offline.
+	RunnerOfflineAfter time.Duration
 }
 
 // Scheduler applies the runner protocol over a store.
 type Scheduler struct {
-	st     *store.Store
-	ttl    int64 // milliseconds
-	logCap int64
+	st          *store.Store
+	ttl         int64 // milliseconds
+	logCap      int64
+	maxAttempts int
+	monitorEach time.Duration
+	offlineMS   int64 // milliseconds
 }
 
 // New builds a Scheduler over st.
@@ -67,11 +87,34 @@ func New(st *store.Store, cfg Config) *Scheduler {
 	if cfg.LogCapBytes <= 0 {
 		cfg.LogCapBytes = DefaultLogCapBytes
 	}
-	return &Scheduler{st: st, ttl: cfg.LeaseTTL.Milliseconds(), logCap: cfg.LogCapBytes}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = DefaultMaxAttempts
+	}
+	if cfg.MonitorInterval <= 0 {
+		cfg.MonitorInterval = DefaultMonitorInterval
+	}
+	if cfg.RunnerOfflineAfter <= 0 {
+		cfg.RunnerOfflineAfter = DefaultRunnerOfflineAfter
+	}
+	return &Scheduler{
+		st: st, ttl: cfg.LeaseTTL.Milliseconds(), logCap: cfg.LogCapBytes, maxAttempts: cfg.MaxAttempts,
+		monitorEach: cfg.MonitorInterval, offlineMS: cfg.RunnerOfflineAfter.Milliseconds(),
+	}
 }
 
 // LeaseTTL is the configured lease duration.
 func (s *Scheduler) LeaseTTL() time.Duration { return time.Duration(s.ttl) * time.Millisecond }
+
+// MaxAttempts is the attempt cap new jobs are created with.
+func (s *Scheduler) MaxAttempts() int { return s.maxAttempts }
+
+// retryable reports whether a failure of this kind may be retried below
+// max_attempts. This is the only place retry eligibility is decided:
+// infra and lost_runner are the platform's fault; exit_code, timeout and
+// cancelled are the job's.
+func retryable(kind string) bool {
+	return kind == store.FailureInfra || kind == store.FailureLostRunner
+}
 
 // RunnerInfo is what a runner presents when it claims.
 type RunnerInfo struct {
@@ -235,7 +278,7 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 			if err := s.event(ctx, tx, job.RunID, jobID, "job.succeeded", map[string]any{"attempt": attempt}); err != nil {
 				return err
 			}
-		case res.FailureKind == store.FailureInfra && attempt < job.MaxAttempts:
+		case retryable(res.FailureKind) && attempt < job.MaxAttempts:
 			if _, err := s.st.RequeueJob(ctx, tx, jobID, attempt, res.Error); err != nil {
 				return err
 			}

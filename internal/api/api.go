@@ -37,7 +37,7 @@ type Config struct {
 	APIToken string
 	// Logger receives one line per request; nil means log.Default().
 	Logger *log.Logger
-	// Scheduler tunes the runner protocol (lease TTL).
+	// Scheduler tunes the runner protocol (lease TTL, max attempts, monitor).
 	Scheduler scheduler.Config
 	// Artifacts holds source bundles and job artifacts. Required: the
 	// server is its only writer.
@@ -84,6 +84,13 @@ func New(st *store.Store, cfg Config) *Server {
 	api.HandleFunc("POST /api/runner/jobs/{id}/attempts/{attempt}/artifacts/{path...}", s.handleUploadArtifact)
 	s.mux.Handle("/api/", s.requireToken(api))
 	return s
+}
+
+// RunMonitor runs the scheduler's lease monitor until ctx ends. The
+// caller owns the goroutine; the server does not start it itself so a
+// test can drive ticks at its own pace.
+func (s *Server) RunMonitor(ctx context.Context) {
+	s.sched.RunMonitor(ctx, s.cfg.Logger)
 }
 
 // ServeHTTP tags every request with an ID, then dispatches.
@@ -172,7 +179,7 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
-	run, jobs, err := submitRun(r.Context(), s.st, runID, p, string(src))
+	run, jobs, err := submitRun(r.Context(), s.st, runID, p, string(src), s.sched.MaxAttempts())
 	if err != nil {
 		if stored {
 			s.discard(artifact.SourceKey(runID))

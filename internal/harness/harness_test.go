@@ -155,15 +155,44 @@ func TestInfraFailureIsReported(t *testing.T) {
 	if done.Run.State != store.RunFailed {
 		t.Fatalf("run state = %s", done.Run.State)
 	}
-	// max_attempts is 1 today, so the infra failure is terminal rather
-	// than requeued; that changes when submit adopts the blueprint default.
-	if j := done.Job("build"); j.State != store.JobFailed || j.FailureKind != "infra" || j.Attempt != 1 {
+	// An infra failure is retried up to max_attempts (default 3), then
+	// terminal; every attempt ran the executor.
+	if j := done.Job("build"); j.State != store.JobFailed || j.FailureKind != "infra" || j.Attempt != 3 {
 		t.Fatalf("build = %+v", j)
+	}
+	if got := countByName(h); got["build"] != 3 {
+		t.Fatalf("build executions = %d, want 3", got["build"])
+	}
+	if types := h.EventTypes(run.Run.ID); count(types, "job.requeued") != 2 || count(types, "job.failed") != 1 {
+		t.Fatalf("event types = %v", types)
 	}
 	for _, name := range []string{"test", "lint", "deploy"} {
 		if j := done.Job(name); j.State != store.JobSkipped {
 			t.Errorf("%s = %s, want skipped", name, j.State)
 		}
+	}
+}
+
+// exit_code failures are the job's fault and are never retried, whatever
+// max_attempts says.
+func TestExitCodeFailureIsNeverRetried(t *testing.T) {
+	h := New(t, Opts{MaxAttempts: 3})
+	h.Script("build", executor.Outcome{ExitCode: 2})
+
+	run := h.Submit(diamond)
+	done := h.WaitRun(run.Run.ID)
+	if done.Run.State != store.RunFailed {
+		t.Fatalf("run state = %s", done.Run.State)
+	}
+	j := done.Job("build")
+	if j.State != store.JobFailed || j.FailureKind != "exit_code" || j.Attempt != 1 || j.ExitCode == nil || *j.ExitCode != 2 {
+		t.Fatalf("build = %+v", j)
+	}
+	if got := countByName(h); got["build"] != 1 {
+		t.Fatalf("build executions = %d, want 1", got["build"])
+	}
+	if types := h.EventTypes(run.Run.ID); count(types, "job.requeued") != 0 {
+		t.Fatalf("event types = %v", types)
 	}
 }
 
@@ -200,21 +229,21 @@ func TestKillAndRestartAgent(t *testing.T) {
 	run := h.Submit(diamond)
 	h.WaitJob(run.Run.ID, "build", store.JobRunning)
 	h.Kill(0)
-	// Shutdown kills the attempt and reports it as an infra failure.
-	if j := h.WaitJob(run.Run.ID, "build", store.JobFailed); j.FailureKind != "infra" {
+	// Shutdown kills the attempt and reports it as an infra failure, which
+	// requeues the job (attempt 1 kept; the next claim makes it 2).
+	if j := h.WaitJob(run.Run.ID, "build", store.JobQueued); j.Attempt != 1 || j.RunnerID != "" {
 		t.Fatalf("build after kill = %+v", j)
 	}
 	id := h.AgentID(0)
 	h.Restart(0)
 	h.Script("build", executor.Outcome{})
-	run2 := h.Submit(diamond)
-	d := h.WaitRun(run2.Run.ID)
+	d := h.WaitRun(run.Run.ID)
 	if d.Run.State != store.RunSucceeded {
 		t.Fatalf("run after restart = %s", d.Run.State)
 	}
 	// Re-registering under the same name is idempotent: same runner_id.
-	if got := h.AgentID(0); got != id || d.Job("build").RunnerID != id {
-		t.Fatalf("runner id after restart = %q (build ran on %q), want %q", got, d.Job("build").RunnerID, id)
+	if got := h.AgentID(0); got != id || d.Job("build").RunnerID != id || d.Job("build").Attempt != 2 {
+		t.Fatalf("runner id after restart = %q (build = %+v), want %q", got, d.Job("build"), id)
 	}
 }
 
@@ -324,19 +353,18 @@ func TestArtifactsAreUploadedListedAndDownloadable(t *testing.T) {
 
 // When the server cannot write to the artifact store the upload is a 500,
 // the runner retries and then reports the attempt as an infra failure:
-// the job never succeeds with missing artifacts. (max_attempts is 1 today,
-// so the failure is terminal rather than requeued, as in
-// TestInfraFailureIsReported.)
+// the job never succeeds with missing artifacts. Being infra, it is
+// retried until max_attempts and only then terminal.
 func TestArtifactStoreFailureIsInfra(t *testing.T) {
-	h := New(t, Opts{})
+	h := New(t, Opts{MaxAttempts: 2})
 	h.Script("build", executor.Outcome{Artifacts: map[string]string{"report.txt": "x"}})
 	h.FailArtifactPuts(true)
 
 	run := h.Submit(artifactsPipeline)
 	done := h.WaitRun(run.Run.ID)
 	build := done.Job("build")
-	if build.State != store.JobFailed || build.FailureKind != "infra" || !strings.Contains(build.Error, "upload artifacts") {
-		t.Fatalf("build = %+v, want failed(infra) from the upload", build)
+	if build.State != store.JobFailed || build.FailureKind != "infra" || build.Attempt != 2 || !strings.Contains(build.Error, "upload artifacts") {
+		t.Fatalf("build = %+v, want failed(infra) from the upload after 2 attempts", build)
 	}
 	arts, err := h.Client().Artifacts(build.ID)
 	if err != nil || len(arts) != 0 {

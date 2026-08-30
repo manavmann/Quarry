@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"quarry/internal/artifact/local"
+	"quarry/internal/scheduler"
 	"quarry/internal/store"
 )
 
@@ -123,8 +124,8 @@ func TestSubmitValidQueuesRoots(t *testing.T) {
 		if j.State != want[j.Name] {
 			t.Errorf("job %s state = %s, want %s", j.Name, j.State, want[j.Name])
 		}
-		if j.MaxAttempts != 1 || j.Attempt != 0 {
-			t.Errorf("job %s attempts = %d/%d, want 0/1", j.Name, j.Attempt, j.MaxAttempts)
+		if j.MaxAttempts != scheduler.DefaultMaxAttempts || j.Attempt != 0 {
+			t.Errorf("job %s attempts = %d/%d, want 0/%d", j.Name, j.Attempt, j.MaxAttempts, scheduler.DefaultMaxAttempts)
 		}
 	}
 	deps, err := st.ListJobDeps(context.Background(), st.Reader(), got.Run.ID)

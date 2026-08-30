@@ -154,3 +154,24 @@ func (s *Store) TouchRunner(ctx context.Context, tx *sql.Tx, runnerID string) er
 	}
 	return s.UpsertRunner(ctx, tx, &Runner{ID: runnerID, Name: runnerID})
 }
+
+// ListExpiredLeases returns every running job whose lease_expires_at is
+// strictly before now, oldest expiry first, for the lease monitor.
+func (s *Store) ListExpiredLeases(ctx context.Context, q Querier, now int64) ([]Job, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT `+jobCols+` FROM jobs WHERE state = ? AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
+		 ORDER BY lease_expires_at, rowid`, JobRunning, now)
+	if err != nil {
+		return nil, fmt.Errorf("store: list expired leases: %w", err)
+	}
+	defer rows.Close()
+	var out []Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: list expired leases: %w", err)
+		}
+		out = append(out, *j)
+	}
+	return out, rows.Err()
+}

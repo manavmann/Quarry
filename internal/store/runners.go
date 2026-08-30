@@ -105,3 +105,32 @@ func (s *Store) GetRunnerByName(ctx context.Context, q Querier, name string) (*R
 	}
 	return r, nil
 }
+
+// MarkRunnersOffline moves every online runner whose last_seen_at is
+// strictly before the cutoff to offline and returns their ids. A runner
+// that was already offline is not returned, so a monitor tick that runs
+// twice reports each transition once.
+func (s *Store) MarkRunnersOffline(ctx context.Context, tx *sql.Tx, before int64) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM runners WHERE state = ? AND last_seen_at < ? ORDER BY id`, RunnerOnline, before)
+	if err != nil {
+		return nil, fmt.Errorf("store: mark runners offline: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("store: mark runners offline: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("store: mark runners offline: %w", err)
+	}
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE runners SET state = ? WHERE id = ? AND state = ?`, RunnerOffline, id, RunnerOnline); err != nil {
+			return nil, fmt.Errorf("store: mark runner %s offline: %w", id, err)
+		}
+	}
+	return ids, nil
+}
