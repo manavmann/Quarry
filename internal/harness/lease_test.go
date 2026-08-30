@@ -53,6 +53,13 @@ func waitRunnerState(t *testing.T, h *Harness, id, state string) {
 func TestLostRunnerJobIsReassigned(t *testing.T) {
 	h := New(t, Opts{Agents: 2, Capacity: 1, LeaseTTL: leaseTTL})
 	h.Script("build", executor.Outcome{Hang: true})
+	// Mute before anything is claimed: whichever runner wins attempt 1 must
+	// never get a heartbeat through. Muting after the claim would race a
+	// heartbeat already past the transport, which the server would stamp
+	// with the advanced clock and so extend the lease past the expiry the
+	// test is about to force.
+	h.MuteHeartbeats(0, true)
+	h.MuteHeartbeats(1, true)
 
 	run := h.Submit(diamond)
 	first := waitAttempt(t, h, run.Run.ID, "build", 1)
@@ -60,7 +67,9 @@ func TestLostRunnerJobIsReassigned(t *testing.T) {
 	if first.RunnerID == h.AgentID(1) {
 		lost, other = 1, 0
 	}
-	h.MuteHeartbeats(lost, true)
+	// The idle runner has no attempt and so no heartbeat in flight; it may
+	// talk again so attempt 2 stays leased.
+	h.MuteHeartbeats(other, false)
 
 	// Attempt 2 also hangs (so it can be observed running), then is released.
 	h.Clock().Advance(leaseTTL + time.Second)

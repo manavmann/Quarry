@@ -261,6 +261,8 @@ func (h *Harness) Restart(i int) {
 // MuteHeartbeats makes agent i's heartbeat requests fail at the transport
 // (or lets them through again): the runner keeps executing, but its
 // leases stop being extended, as with a partitioned or wedged runner.
+// It does not wait for a heartbeat already past the transport, so mute
+// before the agent holds an attempt when a test then moves the clock.
 func (h *Harness) MuteHeartbeats(i int, mute bool) { h.ags[i].net.muteHB.Store(mute) }
 
 // agentTransport is one agent's network path to the server. It drops
