@@ -1,7 +1,9 @@
 package harness
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -179,4 +181,132 @@ func TestSilentRunnerGoesOffline(t *testing.T) {
 	if h.AgentID(0) != id {
 		t.Fatalf("runner id after restart = %q, want %q", h.AgentID(0), id)
 	}
+}
+
+// zombiePipeline is build → {test, lint}: build leaves an artifact so a
+// superseded attempt has something to duplicate, and the two dependents
+// let a test observe that both runners still have a free slot afterwards.
+const zombiePipeline = `name: zombie
+jobs:
+  - name: build
+    image: alpine
+    steps: ["make"]
+    artifacts: ["dist"]
+  - name: test
+    image: alpine
+    steps: ["echo test"]
+    needs: [build]
+  - name: lint
+    image: alpine
+    steps: ["echo lint"]
+    needs: [build]
+`
+
+// A runner that stalls past the lease TTL while still holding a container
+// is a zombie once another runner has finished the job: when it resumes,
+// its heartbeat for the old attempt comes back "abort", it kills the
+// container, reports nothing, and its capacity slot is free again. The
+// job's final state and artifacts are the ones the second runner
+// produced — the zombie's never reach the store.
+func TestZombieRunnerAbortsSupersededAttempt(t *testing.T) {
+	h := New(t, Opts{Agents: 2, Capacity: 1, LeaseTTL: leaseTTL})
+	// Each runner's build leaves a different file, so the listing says
+	// whose artifact survived.
+	for i := 0; i < 2; i++ {
+		h.Exec(i).Script("build", executor.Outcome{Hang: true, Artifacts: map[string]string{
+			"dist/app.bin": "built by " + h.AgentName(i),
+		}})
+	}
+	// test and lint hang so the test can see both running at once.
+	h.Script("test", executor.Outcome{Hang: true})
+	h.Script("lint", executor.Outcome{Hang: true})
+	// Mute before anything is claimed (see TestLostRunnerJobIsReassigned).
+	h.MuteHeartbeats(0, true)
+	h.MuteHeartbeats(1, true)
+
+	run := h.Submit(zombiePipeline)
+	first := waitAttempt(t, h, run.Run.ID, "build", 1)
+	zombie, other := 0, 1
+	if first.RunnerID == h.AgentID(1) {
+		zombie, other = 1, 0
+	}
+	h.MuteHeartbeats(other, false)
+
+	// The zombie stalls past the TTL; the other runner takes attempt 2 and
+	// finishes it, artifact included.
+	h.Clock().Advance(leaseTTL + time.Second)
+	if second := waitAttempt(t, h, run.Run.ID, "build", 2); second.RunnerID != h.AgentID(other) {
+		t.Fatalf("attempt 2 ran on %q, want %q", second.RunnerID, h.AgentID(other))
+	}
+	h.Exec(other).Release("build")
+	build := h.WaitJob(run.Run.ID, "build", store.JobSucceeded)
+	if build.Attempt != 2 || build.RunnerID != h.AgentID(other) {
+		t.Fatalf("build = %+v, want attempt 2 on %q", build, h.AgentID(other))
+	}
+
+	// The zombie resumes: its heartbeat still names attempt 1, the fence
+	// fails, the directive is abort and the executor is killed by context.
+	h.MuteHeartbeats(zombie, false)
+	WaitFor(t, func() bool {
+		for _, x := range h.Exec(zombie).Executions() {
+			if x.Spec.Job.Name == "build" && x.Err != nil {
+				return true
+			}
+		}
+		return false
+	}, "zombie's build container to be killed")
+	var zombieBuilds int
+	for _, x := range h.Exec(zombie).Executions() {
+		if x.Spec.Job.Name != "build" {
+			continue
+		}
+		zombieBuilds++
+		if !errors.Is(x.Err, context.Canceled) {
+			t.Fatalf("zombie build err = %v, want context.Canceled (killed, not finished)", x.Err)
+		}
+	}
+	if zombieBuilds != 1 {
+		t.Fatalf("zombie ran build %d times, want 1", zombieBuilds)
+	}
+
+	// Nothing the zombie did is visible: build is still attempt 2 on the
+	// other runner, and the store holds exactly the other runner's
+	// artifact, once, under attempt 2.
+	if j, _ := h.Client().GetRun(run.Run.ID); j.Job("build").Attempt != 2 || j.Job("build").State != store.JobSucceeded || j.Job("build").RunnerID != h.AgentID(other) {
+		t.Fatalf("build after zombie abort = %+v", j.Job("build"))
+	}
+	arts, err := h.Client().Artifacts(build.ID)
+	if err != nil || len(arts) != 1 || arts[0].Path != "dist/app.bin" {
+		t.Fatalf("artifacts = %+v, %v; want just dist/app.bin", arts, err)
+	}
+	want := "built by " + h.AgentName(other)
+	if got, err := h.Client().Download(build.ID, "dist/app.bin"); err != nil || string(got) != want {
+		t.Fatalf("dist/app.bin = %q, %v; want %q", got, err, want)
+	}
+	keys, err := h.ArtifactStore().List(t.Context(), "runs/")
+	if err != nil || len(keys) != 1 || !strings.HasSuffix(keys[0], "/2/dist/app.bin") {
+		t.Fatalf("store keys = %v, %v; want one key under attempt 2", keys, err)
+	}
+
+	// The zombie's slot is free again: with capacity 1 per runner, test
+	// and lint can only both be running if the zombie claimed one.
+	waitAttempt(t, h, run.Run.ID, "test", 1)
+	waitAttempt(t, h, run.Run.ID, "lint", 1)
+	d, _ := h.Client().GetRun(run.Run.ID)
+	runners := map[string]bool{d.Job("test").RunnerID: true, d.Job("lint").RunnerID: true}
+	if !runners[h.AgentID(zombie)] || !runners[h.AgentID(other)] {
+		t.Fatalf("test on %q, lint on %q; want one on each runner", d.Job("test").RunnerID, d.Job("lint").RunnerID)
+	}
+	h.Release("test")
+	h.Release("lint")
+	if done := h.WaitRun(run.Run.ID); done.Run.State != store.RunSucceeded {
+		t.Fatalf("run state = %s", done.Run.State)
+	}
+	// The abort is not a failure of the run: exactly one requeue, no
+	// job.failed, and the zombie is back online.
+	types := h.EventTypes(run.Run.ID)
+	if count(types, "job.requeued") != 1 || count(types, "job.failed") != 0 {
+		t.Fatalf("event types = %v", types)
+	}
+	waitRunnerState(t, h, h.AgentID(zombie), store.RunnerOnline)
 }

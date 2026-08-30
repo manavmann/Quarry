@@ -251,6 +251,147 @@ still the latest, and the state check is what rejects the lost runner's
 late write. A runner that receives `409` or `abort` kills its container
 and forgets the attempt.
 
+## Runner abort path
+
+A runner learns that an attempt is no longer its own in one of four ways,
+and reacts the same way to all of them:
+
+| signal                                   | when it arrives                                   |
+|------------------------------------------|---------------------------------------------------|
+| heartbeat directive `abort`              | within one heartbeat interval of the fence failing |
+| `409` on `POST …/logs`                   | on the next log flush                             |
+| `409` on `POST …/artifacts/{path}`       | when a finished attempt uploads its artifacts      |
+| `409` on `POST …/complete`               | when a finished attempt reports its result         |
+
+The reaction is *abort*: cancel the attempt's context (the executor kills
+the container and removes it and its volume, exactly as for a timeout),
+discard whatever the log shipper still holds, send nothing more for the
+attempt — not even `complete` — forget the `(job, attempt)` pair, and
+release the capacity slot so the runner can claim again. The abort is not
+reported and not logged server-side: from the control plane's point of
+view the attempt was already over when the lease expired, and the runner
+is only catching up. The server never learns that a zombie existed except
+through the `409`s it rejected.
+
+Two things keep the abort path narrow:
+
+- A `409` met by the final log flush (the one between `Run` returning and
+  `complete`) belongs to a finished execution: the verdict is already
+  fixed, so the flush is discarded but `complete` is still sent, and the
+  server answers *that* with its own `409` if the attempt is stale.
+- An `abort` for an attempt the runner no longer holds (it finished and
+  reported in the same heartbeat interval) is ignored: there is nothing
+  to kill.
+
+Cancellation (`cancel`) takes the same kill path but ends in a
+`complete` with `failure_kind: cancelled`, because there the runner's
+attempt is still the live one and its verdict counts.
+
+## Sequence diagrams
+
+Time flows down. `S` is the control plane, `A`/`B` are runners, `C` is a
+job container. Heartbeats not shown are `continue`.
+
+### One attempt, happy path
+
+```
+ A                          S                      store
+ │ POST register            │                        │
+ │─────────────────────────▶│ upsert runner ────────▶│
+ │◀───── 200 runner_id ─────│                        │
+ │ POST claim               │                        │
+ │─────────────────────────▶│ BEGIN IMMEDIATE        │
+ │                          │  queued → running,     │
+ │                          │  attempt=1, lease=now+ttl
+ │◀──── 200 job attempt 1 ──│ COMMIT                 │
+ │                          │                        │
+ │ (fetch source, start C)  │                        │
+ │ POST logs seq 1..n       │ fence (running,1) ok   │
+ │─────────────────────────▶│ INSERT OR IGNORE ─────▶│
+ │◀──────── 204 ────────────│                        │
+ │ POST heartbeat [ (job,1) ]                        │
+ │─────────────────────────▶│ lease=now+ttl          │
+ │◀──── continue ───────────│                        │
+ │ (C exits 0; collect artifacts)                    │
+ │ POST artifacts/dist/app.bin (Content-Length)      │
+ │─────────────────────────▶│ fence, stream to store,│
+ │◀──── 201 sha256 ─────────│ fence again, upsert row│
+ │ (final log flush)        │                        │
+ │ POST complete succeeded attempt 1                 │
+ │─────────────────────────▶│ BEGIN IMMEDIATE        │
+ │                          │  fence → succeeded     │
+ │                          │  advance dependents    │
+ │                          │  finalize run          │
+ │◀──────── 200 ────────────│ COMMIT                 │
+ │ (slot released, next claim)                       │
+```
+
+### Lost runner: lease expiry and reassignment
+
+```
+ A                    S                     B
+ │ claim → attempt 1  │                     │
+ │◀───────────────────│                     │
+ │ heartbeat continue │                     │
+ │◀───────────────────│                     │
+ ╳ (stalls: GC pause, partition, wedged daemon)
+                      │ … ttl passes, no heartbeat …
+                      │ monitor tick, one Tx:
+                      │  lease_expires_at < now
+                      │  running → queued
+                      │  event job.requeued
+                      │   {failure_kind: lost_runner,
+                      │    attempt: 1, runner_id: A}
+                      │  (or failed(lost_runner) at
+                      │   max_attempts, cascade skips)
+                      │                     │ claim
+                      │◀────────────────────│
+                      │ queued → running,   │
+                      │ attempt=2, runner=B │
+                      │─── 200 attempt 2 ──▶│
+                      │                     │ logs/artifacts/complete
+                      │◀────────────────────│ all fenced (running,2) ✓
+                      │ succeeded, attempt 2, runner_id=B
+```
+
+### Zombie runner: A resumes after B has won
+
+```
+ A                            S                    B
+ ╳ (still stalled)            │ succeeded/attempt 2 ◀── complete ── │
+ │ (resumes; C still running) │                                     │
+ │ POST heartbeat [ (job,1) ] │                                     │
+ │───────────────────────────▶│ UPDATE … WHERE state='running'      │
+ │                            │   AND attempt=1 AND runner_id=A     │
+ │                            │ → 0 rows                            │
+ │◀──────── abort ────────────│                                     │
+ │ cancel ctx → kill C,       │                                     │
+ │ rm container + volume      │                                     │
+ │ drop shipper buffer        │                                     │
+ │ (no complete)              │                                     │
+ │ forget (job,1),            │                                     │
+ │ release capacity slot      │                                     │
+ │ POST claim ───────────────▶│ next queued job, if any             │
+```
+
+If A's container finishes before A's next heartbeat, the same fence
+rejects A's writes instead, and A aborts at the first `409`:
+
+```
+ A                            S
+ │ (C exits 0)                │
+ │ POST artifacts/… attempt 1 │
+ │───────────────────────────▶│ fence (running,1) ✗ — nothing written
+ │◀──────── 409 ──────────────│
+ │ abort: nothing more sent   │
+ │ (no final flush, no complete)
+```
+
+Either way the store holds B's logs under attempt 2, B's artifact rows
+and objects under attempt 2, and none of A's. The harness test
+`TestZombieRunnerAbortsSupersededAttempt` runs this scenario with two
+in-process agents and the fake clock.
+
 ## Retries
 
 - `max_attempts` bounds the number of claims. Only `infra` and

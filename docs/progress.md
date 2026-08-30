@@ -2,6 +2,36 @@
 
 Read this first each session. Newest entry on top.
 
+## C13 · protocol: zombie runner abort, superseded-attempt handling, protocol doc — done
+
+- Landed: no code change — the abort reaction was already complete end to
+  end (C05 heartbeat `abort` on fence failure; C06 `apply` cancels with
+  `errAbort`, nothing reported, slot released by `start`'s defer; C08 logs
+  409 → `OnStale` → abort; C10 upload 409 → abort; complete 409 →
+  `errFenced`, not retried). This entry pins it: harness
+  `TestZombieRunnerAbortsSupersededAttempt` (two agents, capacity 1,
+  per-agent artifact content, fake clock: A muted and hung past TTL, B
+  finishes attempt 2 with its artifact, A unmuted → heartbeat `abort` →
+  A's executor killed with `context.Canceled`, build still attempt 2 on B,
+  exactly one artifact object/row under attempt 2 with B's bytes, then
+  test+lint observed running concurrently — one on each runner — so A's
+  slot was freed; one `job.requeued`, no `job.failed`, A `online`).
+  Verified the test fails (10 s timeout) when `apply("abort")` is a
+  no-op. `docs/protocol.md` gained "Runner abort path" (the four abort
+  signals, the one reaction, the two narrowing rules, cancel vs abort)
+  and "Sequence diagrams" (happy path; lost-runner expiry + reassignment;
+  zombie resume → abort, and the finished-container → 409 variant).
+  Full suite + harness 4× under `-race` clean; `make lint` clean.
+- Flaky: nothing.
+- Next: C14.
+known gap: the harness exercises the heartbeat-abort path only; the
+"finished container → 409 upload → abort" variant is covered by the agent
+unit test `TestAgentArtifactUpload409Aborts` against a stub server, not
+end to end; `make test-docker` not run (daemon down), so "abort cleans
+containers" rests on C07's kill/cleanup tests; `git checkout` on this
+Windows tree writes CRLF (`core.autocrlf=true`) and `gofmt -l` then flags
+the file — normalize to LF before `make lint`.
+
 ## C12 · scheduler: lease monitor, infra-failure retries, runner offline detection — done
 
 - Landed: `scheduler.Config` gains `MaxAttempts` (default 3),
