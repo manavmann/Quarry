@@ -436,6 +436,16 @@ func (c *Client) GetRun(id string) (*RunDetail, error) {
 	return &d, nil
 }
 
+// Cancel posts /api/runs/{id}/cancel and returns the run as the server
+// stored it (terminal already when nothing was running).
+func (c *Client) Cancel(id string) (*RunDetail, error) {
+	var d RunDetail
+	if err := c.do(http.MethodPost, "/api/runs/"+id+"/cancel", "", &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
 // LogChunk is one stored piece of an attempt's output.
 type LogChunk struct {
 	Seq  int64  `json:"seq"`

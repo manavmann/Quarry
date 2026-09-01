@@ -150,20 +150,21 @@ func (s *Store) ListRuns(ctx context.Context, q Querier, limit int) ([]Run, erro
 }
 
 const jobCols = `id, run_id, name, spec_json, state, attempt, max_attempts, runner_id, lease_expires_at,
-	failure_kind, exit_code, error, queued_at, started_at, finished_at`
+	failure_kind, exit_code, error, queued_at, started_at, finished_at, cancel_requested_at, cancel_reason`
 
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var spec string
-	var runner, failure, errMsg sql.NullString
-	var lease, exit, started, finished sql.NullInt64
+	var runner, failure, errMsg, cancelReason sql.NullString
+	var lease, exit, started, finished, cancelAt sql.NullInt64
 	if err := row.Scan(&j.ID, &j.RunID, &j.Name, &spec, &j.State, &j.Attempt, &j.MaxAttempts, &runner, &lease,
-		&failure, &exit, &errMsg, &j.QueuedAt, &started, &finished); err != nil {
+		&failure, &exit, &errMsg, &j.QueuedAt, &started, &finished, &cancelAt, &cancelReason); err != nil {
 		return nil, err
 	}
 	j.SpecJSON = []byte(spec)
 	j.RunnerID, j.FailureKind, j.Error = runner.String, failure.String, errMsg.String
 	j.LeaseExpiresAt, j.StartedAt, j.FinishedAt = lease.Int64, started.Int64, finished.Int64
+	j.CancelRequestedAt, j.CancelReason = cancelAt.Int64, cancelReason.String
 	if exit.Valid {
 		code := int(exit.Int64)
 		j.ExitCode = &code

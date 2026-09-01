@@ -69,6 +69,7 @@ func New(st *store.Store, cfg Config) *Server {
 	api.HandleFunc("POST /api/runs", s.handleSubmitRun)
 	api.HandleFunc("GET /api/runs", s.handleListRuns)
 	api.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
+	api.HandleFunc("POST /api/runs/{id}/cancel", s.handleCancelRun)
 	api.HandleFunc("GET /api/runs/{id}/events", s.handleListEvents)
 	api.HandleFunc("GET /api/runs/{id}/source", s.handleGetSource)
 	api.HandleFunc("GET /api/jobs/{id}", s.handleGetJob)
@@ -270,6 +271,29 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, runDetail(run, jobs))
+}
+
+// handleCancelRun cancels a run: jobs that have not started are cancelled
+// now, running attempts are told to stop on their next heartbeat. 202
+// with the run and its jobs as stored (the run is terminal already when
+// nothing was running), 404 unknown run, 409 run already finished.
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	run, err := s.sched.CancelRun(r.Context(), id)
+	switch {
+	case errors.Is(err, scheduler.ErrRunFinished):
+		writeError(w, r, http.StatusConflict, "run is already finished")
+		return
+	case err != nil:
+		s.storeError(w, r, err, "run")
+		return
+	}
+	jobs, err := s.st.ListJobs(r.Context(), s.st.Reader(), id)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, runDetail(run, jobs))
 }
 
 func (s *Server) handleListEvents(w http.ResponseWriter, r *http.Request) {

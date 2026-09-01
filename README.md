@@ -57,8 +57,8 @@ quarry logs <job> [-f] [--attempt N]     print a job's log; -f follows until the
                                          finished and the log is drained
 quarry events <run> [-f]                 print a run's events
 quarry runners                           list registered runners
-quarry cancel <run>                      request cancellation (server endpoint lands with the
-                                         cancel path; 404 until then)
+quarry cancel <run>                      cancel a run: unstarted jobs are cancelled at once,
+                                         running ones killed on their next heartbeat
 ```
 
 `--interval` sets the poll period for `watch`, `--wait` and `-f` (default 1s).

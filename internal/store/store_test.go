@@ -38,8 +38,8 @@ func TestMigrateFreshDB(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	v, err := s.SchemaVersion(ctx)
-	if err != nil || v != 4 {
-		t.Fatalf("SchemaVersion = %d, %v; want 4", v, err)
+	if err != nil || v != 5 {
+		t.Fatalf("SchemaVersion = %d, %v; want 5", v, err)
 	}
 	for _, tbl := range []string{"runs", "jobs", "job_deps", "runners", "events", "log_chunks", "artifacts"} {
 		var n int
@@ -64,8 +64,8 @@ func TestMigrateFreshDB(t *testing.T) {
 	}
 	defer s.Close()
 	var applied int
-	if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil || applied != 4 {
-		t.Fatalf("schema_migrations rows = %d, %v; want 4", applied, err)
+	if err := s.Reader().QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil || applied != 5 {
+		t.Fatalf("schema_migrations rows = %d, %v; want 5", applied, err)
 	}
 }
 

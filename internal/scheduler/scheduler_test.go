@@ -35,9 +35,10 @@ func newScheduler(t *testing.T, ttl time.Duration) (*Scheduler, *store.Store, *f
 
 // spec is one job of a test DAG.
 type spec struct {
-	needs  []string
-	labels map[string]string
-	maxAtt int
+	needs   []string
+	labels  map[string]string
+	maxAtt  int
+	timeout time.Duration
 }
 
 // dag inserts a run whose jobs are given in declaration order and returns
@@ -52,7 +53,7 @@ func dag(t *testing.T, st *store.Store, order []string, specs map[string]spec) (
 	for _, name := range order {
 		sp := specs[name]
 		ids[name] = run.ID + "-" + name
-		pj := pipeline.Job{Name: name, Image: "alpine", Steps: []string{"true"}, Needs: sp.needs, Labels: sp.labels}
+		pj := pipeline.Job{Name: name, Image: "alpine", Steps: []string{"true"}, Needs: sp.needs, Labels: sp.labels, Timeout: sp.timeout}
 		raw, _ := json.Marshal(pj)
 		state := store.JobPending
 		if len(sp.needs) == 0 {

@@ -175,3 +175,54 @@ func (s *Store) ListExpiredLeases(ctx context.Context, q Querier, now int64) ([]
 	}
 	return out, rows.Err()
 }
+
+// CancelJob moves a job that has not started (pending or queued) straight
+// to cancelled with failure_kind cancelled. ok=false means the job was in
+// some other state.
+func (s *Store) CancelJob(ctx context.Context, tx *sql.Tx, jobID, errMsg string) (bool, error) {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET state = ?, failure_kind = ?, error = ?, finished_at = ?
+		 WHERE id = ? AND state IN (?, ?)`,
+		JobCancelled, FailureCancelled, nullStr(errMsg), s.now(), jobID, JobPending, JobQueued)
+	if err != nil {
+		return false, fmt.Errorf("store: cancel job %s: %w", jobID, err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// RequestJobCancel records that the running attempt of jobID must be
+// killed; the next heartbeat carrying it gets the cancel directive.
+// ok=false means the job is not running or a request is already pending
+// (the first reason stands).
+func (s *Store) RequestJobCancel(ctx context.Context, tx *sql.Tx, jobID, reason string) (bool, error) {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET cancel_requested_at = ?, cancel_reason = ?
+		 WHERE id = ? AND state = ? AND cancel_requested_at IS NULL`,
+		s.now(), reason, jobID, JobRunning)
+	if err != nil {
+		return false, fmt.Errorf("store: request cancel of job %s: %w", jobID, err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// ListRunningJobs returns every running job with no pending cancel
+// request, oldest start first, for the monitor's timeout backstop.
+func (s *Store) ListRunningJobs(ctx context.Context, q Querier) ([]Job, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT `+jobCols+` FROM jobs WHERE state = ? AND cancel_requested_at IS NULL ORDER BY started_at, rowid`, JobRunning)
+	if err != nil {
+		return nil, fmt.Errorf("store: list running jobs: %w", err)
+	}
+	defer rows.Close()
+	var out []Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: list running jobs: %w", err)
+		}
+		out = append(out, *j)
+	}
+	return out, rows.Err()
+}

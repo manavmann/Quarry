@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,5 +55,57 @@ jobs:
 		if err != nil || string(got) != want {
 			t.Errorf("%s: err=%v len=%d, want len=%d", p, err, len(got), len(want))
 		}
+	}
+}
+
+// End to end: `quarry cancel <run>` against a real server and agent stops
+// a hanging job through the heartbeat directive, the run ends cancelled,
+// `quarry watch` reports it with exit 1, and a second cancel is a 409.
+func TestCancelEndToEnd(t *testing.T) {
+	h := harness.New(t, harness.Opts{})
+	h.Script("build", executor.Outcome{Hang: true})
+	run := h.Submit(`name: e2e-cancel
+jobs:
+  - name: build
+    image: alpine
+    steps: ["make"]
+  - name: test
+    image: alpine
+    steps: ["make test"]
+    needs: [build]
+`)
+	h.WaitJob(run.Run.ID, "build", store.JobRunning)
+
+	var out, errOut bytes.Buffer
+	root := New(&out, &errOut)
+	root.SetArgs([]string{"--server", h.URL(), "--token", harness.Token, "cancel", run.Run.ID})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if !strings.Contains(out.String(), "cancel requested") {
+		t.Fatalf("cancel output = %q", out.String())
+	}
+
+	out.Reset()
+	root = New(&out, &errOut)
+	root.SetArgs([]string{"--server", h.URL(), "--token", harness.Token, "--interval", "10ms", "watch", run.Run.ID})
+	err := root.ExecuteContext(context.Background())
+	var exit *ExitError
+	if !errors.As(err, &exit) || exit.Code != 1 {
+		t.Fatalf("watch err = %v, want ExitError{1}", err)
+	}
+	if !strings.Contains(out.String(), "run "+run.Run.ID+": cancelled") || !strings.Contains(out.String(), "cancelled") {
+		t.Fatalf("watch output:\n%s", out.String())
+	}
+	final := h.WaitRun(run.Run.ID)
+	if final.Job("build").State != store.JobCancelled || final.Job("test").State != store.JobCancelled {
+		t.Fatalf("jobs = %+v", final.Jobs)
+	}
+
+	root = New(&out, &errOut)
+	root.SetArgs([]string{"--server", h.URL(), "--token", harness.Token, "cancel", run.Run.ID})
+	var apiErr *APIError
+	if err := root.ExecuteContext(context.Background()); !errors.As(err, &apiErr) || apiErr.Status != 409 {
+		t.Fatalf("second cancel err = %v, want 409", err)
 	}
 }

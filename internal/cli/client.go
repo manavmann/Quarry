@@ -281,8 +281,9 @@ func (c *Client) ListRunners(ctx context.Context) ([]Runner, error) {
 	return out.Runners, err
 }
 
-// Cancel asks the server to cancel a run. The endpoint is not served yet
-// (cancel is reserved in the protocol); until it lands this is a 404.
+// Cancel asks the server to cancel a run: jobs that have not started are
+// cancelled at once, running ones are stopped on their next heartbeat.
+// 409 (APIError) means the run had already finished.
 func (c *Client) Cancel(ctx context.Context, runID string) error {
 	return c.do(ctx, http.MethodPost, "/api/runs/"+url.PathEscape(runID)+"/cancel", nil, nil)
 }

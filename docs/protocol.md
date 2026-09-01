@@ -11,6 +11,9 @@ pending ──(all needs succeeded)──▶ queued ─(claim)──▶ running 
    │                                 ▲                   │           failed
    └──(a need failed/cancelled/──▶ skipped               └──(infra, attempt < max_attempts;
         skipped)                                              or lease expired)──▶ queued
+
+pending | queued ──(run cancelled)──▶ cancelled
+running ──(cancel directive, runner reports cancelled)──▶ cancelled
 ```
 
 `queued` means the job is claimable. `attempt`
@@ -83,7 +86,9 @@ Reply carries one directive per job:
 | directive  | meaning                                                          |
 |------------|------------------------------------------------------------------|
 | `continue` | lease extended, keep going                                       |
-| `cancel`   | reserved: a user cancelled the job (lands with `quarry cancel`)  |
+| `cancel`   | lease extended, but a cancel is pending (user cancel or timeout  |
+|            | backstop). Kill the container, report `failed(cancelled)` — this |
+|            | attempt is still the live one and its verdict counts             |
 | `abort`    | the fence failed — the job is unknown, not running, or the       |
 |            | attempt is not yours any more. Kill the container, report nothing |
 
@@ -107,10 +112,13 @@ Everything below happens in **one transaction**, in this order:
    - otherwise → `409` (stale attempt, requeued job, unknown attempt).
    The runner treats 409 as *abort*.
 2. **Terminal transition.** `succeeded` → `succeeded`. `failed` with
-   kind `infra` and `attempt < max_attempts` → back to `queued` at the
-   queue tail (`runner_id=NULL`, `queued_at=now`, attempt unchanged;
-   event `job.requeued`). Any other failure → `failed` with the kind and
-   exit code. Events `job.succeeded` / `job.failed`.
+   kind `cancelled` → job state `cancelled` (event `job.cancelled`), or
+   `failed(timeout)` (event `job.failed`) when the pending cancel was the
+   monitor's timeout backstop rather than a user. `failed` with kind
+   `infra` and `attempt < max_attempts` and no cancel pending → back to
+   `queued` at the queue tail (`runner_id=NULL`, `queued_at=now`, attempt
+   unchanged; event `job.requeued`). Any other failure → `failed` with
+   the kind and exit code. Events `job.succeeded` / `job.failed`.
 3. **Advancement.** For every `pending` job of the run, until nothing
    changes: all needs `succeeded` → `queued` (`job.queued`); any need in
    `failed | cancelled | skipped` → `skipped` (`job.skipped`). Because the
@@ -241,6 +249,33 @@ Streams the run's workspace bundle (`application/x-tar`) from
 part as it arrived. `404` when the run does not exist or was submitted
 without a bundle; the Docker executor then runs the job in an empty
 `/workspace`.
+
+### `POST /api/runs/{id}/cancel` (user API)
+
+Cancels a run, in one transaction:
+
+1. every `pending` or `queued` job → `cancelled` with
+   `failure_kind=cancelled` (event `job.cancelled`) — it never runs;
+2. every `running` job gets `cancel_requested_at=now, cancel_reason=user`
+   (event `job.cancel_requested`); its runner's next heartbeat answers
+   `cancel`, the runner kills the container and reports
+   `failed(cancelled)`, which `complete` records as a `cancelled` job;
+3. event `run.cancel_requested`, then the usual advancement and
+   finalization: the run is `cancelled` at once when nothing was running,
+   otherwise it stays `running` until the last attempt reports.
+
+A job with a cancel pending is never requeued, whatever it reports.
+Responses: `202` with the run and jobs as stored, `404` unknown run,
+`409` run already finished. Repeating the call while attempts wind down
+is a no-op `202`.
+
+**Timeout backstop.** The runner enforces each job's `timeout` through the
+executor context and reports `failed(timeout)` itself. The lease monitor
+additionally asks for a cancel (`cancel_reason=timeout`, event
+`job.cancel_requested {reason: timeout}`) for any running job whose
+`started_at + timeout + grace` (grace 30 s) is in the past — a runner that
+somehow did not enforce the timeout is told to kill the job on its next
+heartbeat, and its `cancelled` report is recorded as `failed(timeout)`.
 
 ## Fencing rule
 
@@ -422,8 +457,10 @@ in-process agents and the fake clock.
 - API reads are read-your-writes after any 2xx.
 - Logs are totally ordered per attempt by `seq`, visible within roughly
   flush interval + poll interval (~0.75 s).
-- Cancellation is best-effort and bounded by one heartbeat interval plus
-  kill time.
+- Cancellation is context-driven end to end: `POST /api/runs/{id}/cancel`
+  → heartbeat `cancel` → the attempt's context is cancelled → the executor
+  kills the container → `failed(cancelled)`. Jobs that had not started
+  never do. Latency is one heartbeat interval (5 s) plus kill time.
 - Run result is a pure function of terminal job states.
 - Not provided: exactly-once side effects (a deploy step can run twice if
   a runner is partitioned — jobs must be idempotent, same as every real

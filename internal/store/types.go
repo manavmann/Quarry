@@ -32,6 +32,14 @@ const (
 	FailureCancelled  = "cancelled"   // cancelled by a user
 )
 
+// Cancel reasons, recorded in jobs.cancel_reason when the server asks a
+// runner to kill an attempt: who asked decides how the runner's
+// `cancelled` report is classified.
+const (
+	CancelReasonUser    = "user"    // POST /api/runs/{id}/cancel → job cancelled
+	CancelReasonTimeout = "timeout" // monitor backstop → job failed(timeout)
+)
+
 // Runner states.
 const (
 	RunnerOnline  = "online"
@@ -60,7 +68,8 @@ type Run struct {
 // treats it as opaque bytes. Attempt increments on every claim so
 // runner-side writes can be fenced on (state='running', attempt);
 // MaxAttempts bounds retries. FailureKind is one of the Failure* constants
-// once the job has failed, "" otherwise.
+// once the job has failed, "" otherwise. CancelRequestedAt/CancelReason
+// are set while a running attempt has a cancel directive waiting for it.
 type Job struct {
 	ID             string
 	RunID          string
@@ -77,6 +86,9 @@ type Job struct {
 	QueuedAt       int64
 	StartedAt      int64
 	FinishedAt     int64
+
+	CancelRequestedAt int64
+	CancelReason      string
 }
 
 // JobDep is an edge: JobID cannot start until NeedsJobID succeeds.

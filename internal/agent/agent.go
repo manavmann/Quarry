@@ -366,6 +366,10 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 
 	var req completeRequest
 	switch {
+	case errors.Is(cause, errTimeout):
+		req = completeRequest{Status: statusFailed, FailureKind: kindTimeout, Error: errTimeout.Error()}
+	case errors.Is(cause, errCancelled):
+		req = completeRequest{Status: statusFailed, FailureKind: kindCancelled, Error: errCancelled.Error()}
 	case execErr == nil:
 		if res.ExitCode == 0 {
 			req = completeRequest{Status: statusSucceeded}
@@ -380,10 +384,6 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 	case aborted:
 		logger.Printf("job %s attempt %d: aborted by server, result discarded", job.ID, job.Attempt)
 		return
-	case errors.Is(cause, errTimeout):
-		req = completeRequest{Status: statusFailed, FailureKind: kindTimeout, Error: errTimeout.Error()}
-	case errors.Is(cause, errCancelled):
-		req = completeRequest{Status: statusFailed, FailureKind: kindCancelled, Error: errCancelled.Error()}
 	case ctx.Err() != nil:
 		req = completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: errShutdown.Error()}
 	default:

@@ -97,5 +97,5 @@ only when the fleet can take work.
 
 ## Not yet
 
-The `quarry cancel` server path, `/metrics`, artifact retention, `web/`.
+`/metrics`, artifact retention, `web/`.
 Tracked in `docs/progress.md`.

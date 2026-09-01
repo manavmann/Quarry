@@ -4,6 +4,7 @@
 # and Go; nothing else. Run from anywhere:
 #
 #   scripts/demo.sh            # up + run + watch
+#   scripts/demo.sh cancel     # up + run + cancel it mid-flight + watch it end cancelled
 #   scripts/demo.sh down       # tear the cluster down (keeps quarry-data)
 #   scripts/demo.sh down -v    # ... and delete the data volume too
 #
@@ -41,8 +42,66 @@ say "Runners registered:"
 "$quarry" runners
 
 say "Submitting examples/go-app"
-run=$("$quarry" run -C "$root/examples/go-app")
+if [ "${1:-}" = "cancel" ]; then
+  # Hold the first job inside its container long enough to observe and
+  # cancel it, without changing the example pipeline on disk.
+  cancel_pipeline=$(mktemp)
+  trap 'rm -f "$cancel_pipeline"' 0
+  awk '{ print } !added && /^    steps:/ {
+    print "      - echo quarry-cancel-ready"
+    print "      - sleep 60"
+    added = 1
+  }' "$root/examples/go-app/.quarry.yml" > "$cancel_pipeline"
+  run=$("$quarry" run -C "$root/examples/go-app" -f "$cancel_pipeline")
+  rm -f "$cancel_pipeline"
+  trap - 0
+else
+  run=$("$quarry" run -C "$root/examples/go-app")
+fi
 echo "run $run"
+
+if [ "${1:-}" = "cancel" ]; then
+  # The cancel beat: observe output from an executing container, cancel
+  # the run, then watch it end cancelled. watch exits 1
+  # for any non-succeeded run, which here is the expected outcome.
+  say "Waiting for a job container of $run to execute its ready marker"
+  i=0
+  while :; do
+    containers=$(docker ps --filter label=quarry.run="$run" --filter status=running --format "{{.ID}}")
+    container=$(printf '%s\n' "$containers" | head -n 1)
+    if [ -n "$container" ] && docker logs "$container" 2>&1 | grep -qx quarry-cancel-ready; then
+      [ "$(docker inspect --format '{{.State.Running}}' "$container")" = true ] && break
+    fi
+    i=$((i + 1))
+    if [ "$i" -gt 120 ]; then echo "no executing job observed within 60 s"; "$quarry" status "$run"; exit 1; fi
+    sleep 0.5
+  done
+  echo "Container $container emitted quarry-cancel-ready and is still running."
+  "$quarry" status "$run"
+  say "Cancelling run $run"
+  "$quarry" cancel "$run"
+  say "Watching run $run wind down"
+  if "$quarry" watch "$run"; then
+    say "Run $run succeeded despite the cancel — the cancel did not land"
+    exit 1
+  else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+  fi
+  if ! "$quarry" status "$run" | head -n 1 | grep -q cancelled; then
+    say "Run $run ended in a state other than cancelled"
+    "$quarry" status "$run"; exit 1
+  fi
+  say "Run $run is cancelled; events:"
+  "$quarry" events "$run"
+  containers=$(docker ps --filter label=quarry.run="$run" --format "{{.Names}}")
+  if [ -n "$containers" ]; then
+    say "job containers of $run are still running:"; docker ps --filter label=quarry.run="$run"; exit 1
+  fi
+  echo "No job container of $run left running."
+  echo "Tear down with: $0 down"
+  exit 0
+fi
 
 say "Watching run $run"
 if "$quarry" watch "$run"; then

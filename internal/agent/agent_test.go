@@ -339,6 +339,41 @@ func TestAgentTimeoutReportsTimeout(t *testing.T) {
 	}
 }
 
+// An executor can return an exit result as cancellation races with its
+// completion. The context cause must still decide cancellation/timeout.
+type exitAfterContext struct{ code int }
+
+func (e exitAfterContext) Run(ctx context.Context, _ executor.JobSpec, _ io.Writer) (executor.Result, error) {
+	<-ctx.Done()
+	return executor.Result{ExitCode: e.code}, nil
+}
+
+func TestAgentCancelAndTimeoutCauseOverridesExitResult(t *testing.T) {
+	for _, cause := range []struct {
+		name, directive, kind string
+		timeout               time.Duration
+	}{
+		{name: "cancel", directive: "cancel", kind: kindCancelled},
+		{name: "timeout", timeout: 10 * time.Millisecond, kind: kindTimeout},
+	} {
+		for _, result := range []struct {
+			name string
+			code int
+		}{{"success", 0}, {"killed", 137}} {
+			t.Run(cause.name+"/"+result.name, func(t *testing.T) {
+				s := newStub(t)
+				s.enqueue("race", cause.timeout)
+				s.directive = cause.directive
+				startAgent(t, s, exitAfterContext{code: result.code}, 1)
+				waitFor(t, func() bool { return len(s.completed()) == 1 }, "completion")
+				if r := s.completed()[0].Req; r.Status != statusFailed || r.FailureKind != cause.kind || r.ExitCode != nil {
+					t.Fatalf("got %+v, want failed(%s) without an exit code", r, cause.kind)
+				}
+			})
+		}
+	}
+}
+
 func TestAgentInfraErrorAndCompleteRetry(t *testing.T) {
 	s := newStub(t)
 	s.enqueue("infra", 0)

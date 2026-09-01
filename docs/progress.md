@@ -2,6 +2,12 @@
 
 Read this first each session. Newest entry on top.
 
+## C14 · runs: cancellation and job timeouts — done
+
+- Landed: cancel API/CLI, heartbeat directives, per-job timeouts and server backstop; context-first verdicts, idempotent events, no retry after cancellation (including lease expiry), and terminal run finalization.
+- Verified: targeted tests, `go test -race ./...`, `go vet ./...`, gofmt, Docker `TestDockerCancelKill`/`TestDockerTimeoutKill`, CLI cancel, one-heartbeat propagation, and `scripts/demo.sh cancel` against an executing container (run cancelled, watch exit 1, no running job container).
+- Flaky: none observed. Next: C15 (not started). Cancel-pending lease expiry remains terminal `failed(lost_runner)` without retry.
+
 ## C13 · protocol: zombie runner abort, superseded-attempt handling, protocol doc — done
 
 - Landed: no code change — the abort reaction was already complete end to

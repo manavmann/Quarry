@@ -12,8 +12,8 @@ decided by the kind alone — never by who reported it or how many times.
 | kind          | who decides           | meaning                                  | retried below `max_attempts` |
 |---------------|-----------------------|------------------------------------------|------------------------------|
 | `exit_code`   | runner                | the container exited non-zero            | no — the job's fault         |
-| `timeout`     | runner                | the job ran past its `timeout`           | no                           |
-| `cancelled`   | runner (on directive) | a user cancelled the run                 | no                           |
+| `timeout`     | runner (ctx deadline); server backstop after timeout + 30 s grace | the job ran past its `timeout` | no         |
+| `cancelled`   | runner (on `cancel` directive) | a user cancelled the run; the job ends `cancelled`, not `failed` | no |
 | `infra`       | runner                | image pull, container setup, artifact upload, runner shutting down | yes |
 | `lost_runner` | **server monitor**    | the lease expired without a completion   | yes                          |
 
@@ -36,6 +36,9 @@ server rejects it with 400.
 | lost runner comes back                   | its heartbeat gets `abort`; its late `complete`/logs/artifacts get 409; it kills the container and forgets the attempt | nothing — the newer attempt's result stands                      | `TestLostRunnerJobIsReassigned`, scheduler `TestTickRequeuesExpiredLease…` |
 | runner silent for 30 s                   | `offline` in `GET /api/runners`; any claim or heartbeat makes it `online` again                                       | `quarry runners` shows `offline`                                 | `TestSilentRunnerGoesOffline` |
 | control plane restarts                   | leases and queue are in SQLite; runners retry with backoff; the monitor resumes on the next tick                      | a pause, no lost work                                            | compose: `run survives compose restart server` (C11) |
+| user runs `quarry cancel`                | jobs not yet started → `cancelled` at once; running attempts get `cancel` on the next heartbeat (≤ 5 s), the executor context is cancelled, the container killed, the attempt reported `failed(cancelled)` → job `cancelled`; run `cancelled` (or `failed` if a job had already failed) | `cancelled` rows, `job.cancel_requested` / `job.cancelled` events, `watch` exits 1 | `TestCancelPropagatesWithinOneHeartbeat`, cli `TestCancelEndToEnd` |
+| a step outruns its `timeout`             | the runner's executor context expires: container killed, `failed(timeout)`, dependents `skipped`, never retried             | `failed (timeout)`, attempt 1/3                                  | `TestJobTimeoutIsEnforcedByRunner`, docker `TestDockerTimeoutKill` |
+| a runner fails to enforce the timeout    | the monitor sees `started_at + timeout + 30 s < now` and asks for a cancel (`reason: timeout`); the runner kills the job on its next heartbeat and its `cancelled` report is stored as `failed(timeout)` | `job.cancel_requested {reason: timeout}`, then `failed (timeout)` | `TestTimeoutBackstopCancelsThroughHeartbeat` |
 
 ## The monitor
 
@@ -44,7 +47,9 @@ One goroutine on the server (`scheduler.RunMonitor`, owned by `cmd/server`
 
 1. every `running` job with `lease_expires_at < now` → `queued`
    (`attempt < max_attempts`) or `failed(lost_runner)` + DAG advancement;
-2. every `online` runner with `last_seen_at < now - 30s` → `offline`.
+2. every `running` job past `started_at + timeout + 30 s` with no cancel
+   pending gets a cancel request (`reason: timeout`) for its next heartbeat;
+3. every `online` runner with `last_seen_at < now - 30s` → `offline`.
 
 A tick never selects what the previous tick changed, so it is idempotent,
 and it reads time only from the store's injected clock — the harness
@@ -62,5 +67,4 @@ work, never a duplicate result.
 
 Exactly-once side effects (a partitioned runner may finish a superseded
 attempt's `deploy` step before its next heartbeat says `abort`), OOM as a
-distinct kind (it is `exit_code` with `OOMKilled` in the executor result),
-user cancellation (no server path yet).
+distinct kind (it is `exit_code` with `OOMKilled` in the executor result).

@@ -38,10 +38,19 @@ const DefaultMonitorInterval = 5 * time.Second
 // the monitor marks it offline.
 const DefaultRunnerOfflineAfter = 30 * time.Second
 
+// DefaultTimeoutGrace is how far past its timeout a running job may be
+// before the monitor's backstop asks the runner to cancel it. The runner
+// enforces the timeout itself; the backstop only catches one that did not.
+const DefaultTimeoutGrace = 30 * time.Second
+
 // ErrFenced is returned when a runner-side write fails the
 // (state='running', attempt) check: the attempt is stale, the job was
 // requeued, or it is not running. Callers map it to 409.
 var ErrFenced = errors.New("scheduler: attempt is not the running attempt")
+
+// ErrRunFinished is returned by CancelRun for a run that is already
+// terminal. Callers map it to 409.
+var ErrRunFinished = errors.New("scheduler: run is already finished")
 
 // InvalidResultError is returned by Complete when the reported status or
 // failure kind is not one the protocol allows, and by AppendLogs for a bad
@@ -53,7 +62,7 @@ func (e *InvalidResultError) Error() string { return "scheduler: invalid request
 // Heartbeat directives, one per reported job.
 const (
 	DirectiveContinue = "continue"
-	DirectiveCancel   = "cancel" // reserved for user cancellation
+	DirectiveCancel   = "cancel" // kill the attempt, report failed(cancelled)
 	DirectiveAbort    = "abort"
 )
 
@@ -67,6 +76,9 @@ type Config struct {
 	MonitorInterval time.Duration
 	// RunnerOfflineAfter is the silence after which a runner is offline.
 	RunnerOfflineAfter time.Duration
+	// TimeoutGrace is how far past its timeout a running job may be before
+	// the monitor asks its runner to cancel it.
+	TimeoutGrace time.Duration
 }
 
 // Scheduler applies the runner protocol over a store.
@@ -77,6 +89,7 @@ type Scheduler struct {
 	maxAttempts int
 	monitorEach time.Duration
 	offlineMS   int64 // milliseconds
+	graceMS     int64 // milliseconds
 }
 
 // New builds a Scheduler over st.
@@ -96,9 +109,13 @@ func New(st *store.Store, cfg Config) *Scheduler {
 	if cfg.RunnerOfflineAfter <= 0 {
 		cfg.RunnerOfflineAfter = DefaultRunnerOfflineAfter
 	}
+	if cfg.TimeoutGrace <= 0 {
+		cfg.TimeoutGrace = DefaultTimeoutGrace
+	}
 	return &Scheduler{
 		st: st, ttl: cfg.LeaseTTL.Milliseconds(), logCap: cfg.LogCapBytes, maxAttempts: cfg.MaxAttempts,
 		monitorEach: cfg.MonitorInterval, offlineMS: cfg.RunnerOfflineAfter.Milliseconds(),
+		graceMS: cfg.TimeoutGrace.Milliseconds(),
 	}
 }
 
@@ -202,7 +219,10 @@ type Directive struct {
 
 // Heartbeat refreshes the runner's last_seen_at and extends the lease of
 // every listed attempt that is still (running, attempt, this runner).
-// Attempts that fail the fence get abort; the runner must kill them.
+// Attempts that fail the fence get abort; the runner must kill them. A
+// live attempt with a pending cancel request gets cancel: the lease is
+// still extended, because the runner's failed(cancelled) report is the
+// live attempt's verdict and must pass the fence.
 func (s *Scheduler) Heartbeat(ctx context.Context, runnerID string, jobs []JobRef) ([]Directive, error) {
 	if runnerID == "" {
 		return nil, errors.New("scheduler: Heartbeat: runner id is required")
@@ -221,6 +241,13 @@ func (s *Scheduler) Heartbeat(ctx context.Context, runnerID string, jobs []JobRe
 			d := DirectiveAbort
 			if ok {
 				d = DirectiveContinue
+				job, err := s.st.GetJob(ctx, tx, j.JobID)
+				if err != nil {
+					return err
+				}
+				if job.CancelRequestedAt != 0 {
+					d = DirectiveCancel
+				}
 			}
 			out = append(out, Directive{JobID: j.JobID, Attempt: j.Attempt, Directive: d})
 		}
@@ -278,7 +305,23 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 			if err := s.event(ctx, tx, job.RunID, jobID, "job.succeeded", map[string]any{"attempt": attempt}); err != nil {
 				return err
 			}
-		case retryable(res.FailureKind) && attempt < job.MaxAttempts:
+		case res.FailureKind == store.FailureCancelled:
+			// The runner killed the attempt on a cancel directive; who asked
+			// for it decides the record: a user cancel is a cancelled job,
+			// the monitor's timeout backstop is a failed(timeout) one.
+			state, kind, msg, typ := store.JobCancelled, store.FailureCancelled, res.Error, "job.cancelled"
+			if job.CancelReason == store.CancelReasonTimeout {
+				state, kind, msg, typ = store.JobFailed, store.FailureTimeout, "job timed out (server backstop)", "job.failed"
+			}
+			if _, err := s.st.FinishJob(ctx, tx, jobID, attempt, state, kind, res.ExitCode, msg); err != nil {
+				return err
+			}
+			if err := s.event(ctx, tx, job.RunID, jobID, typ,
+				map[string]any{"attempt": attempt, "failure_kind": kind, "error": msg}); err != nil {
+				return err
+			}
+		case retryable(res.FailureKind) && attempt < job.MaxAttempts && job.CancelRequestedAt == 0:
+			// A job whose cancel is pending never gets another attempt.
 			if _, err := s.st.RequeueJob(ctx, tx, jobID, attempt, res.Error); err != nil {
 				return err
 			}
@@ -300,6 +343,79 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 			return err
 		}
 		out, err = s.st.GetJob(ctx, tx, jobID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CancelRun cancels a run on a user's behalf, in one transaction: every
+// pending or queued job goes straight to cancelled (event job.cancelled),
+// every running job gets a cancel request that its runner's next
+// heartbeat turns into the cancel directive (event job.cancel_requested),
+// and the run is finalized at once when nothing was running. Otherwise
+// the run stays running until the last attempt reports and Complete
+// finalizes it as cancelled. A terminal run is ErrRunFinished, an unknown
+// one ErrNotFound; repeating the call on a run that is still winding
+// down is a no-op.
+func (s *Scheduler) CancelRun(ctx context.Context, runID string) (*store.Run, error) {
+	var out *store.Run
+	err := s.st.Tx(ctx, func(tx *sql.Tx) error {
+		run, err := s.st.GetRun(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		if run.State != store.RunPending && run.State != store.RunRunning {
+			return ErrRunFinished
+		}
+		events, err := s.st.ListEvents(ctx, tx, runID, 0, 0)
+		if err != nil {
+			return err
+		}
+		for _, event := range events {
+			if event.Type == "run.cancel_requested" {
+				out = run
+				return nil
+			}
+		}
+		jobs, err := s.st.ListJobs(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		for i := range jobs {
+			job := &jobs[i]
+			switch job.State {
+			case store.JobPending, store.JobQueued:
+				if ok, err := s.st.CancelJob(ctx, tx, job.ID, "cancelled by user"); err != nil {
+					return err
+				} else if !ok {
+					continue
+				}
+				if err := s.event(ctx, tx, runID, job.ID, "job.cancelled",
+					map[string]any{"attempt": job.Attempt, "failure_kind": store.FailureCancelled}); err != nil {
+					return err
+				}
+			case store.JobRunning:
+				if ok, err := s.st.RequestJobCancel(ctx, tx, job.ID, store.CancelReasonUser); err != nil {
+					return err
+				} else if !ok {
+					continue // a request is already pending: nothing new to say
+				}
+				if err := s.event(ctx, tx, runID, job.ID, "job.cancel_requested",
+					map[string]any{"attempt": job.Attempt, "runner_id": job.RunnerID, "reason": store.CancelReasonUser}); err != nil {
+					return err
+				}
+			}
+		}
+		if err := s.event(ctx, tx, runID, "", "run.cancel_requested", nil); err != nil {
+			return err
+		}
+		if err := s.advance(ctx, tx, runID); err != nil {
+			return err
+		}
+		out, err = s.st.GetRun(ctx, tx, runID)
 		return err
 	})
 	if err != nil {
@@ -421,13 +537,19 @@ func isTerminal(state string) bool {
 	return false
 }
 
-// specLabels reads the labels a job requires from its stored spec.
-func specLabels(j *store.Job) (map[string]string, error) {
+// jobSpec decodes a job's stored spec.
+func jobSpec(j *store.Job) (pipeline.Job, error) {
 	var spec pipeline.Job
 	if err := json.Unmarshal(j.SpecJSON, &spec); err != nil {
-		return nil, fmt.Errorf("scheduler: decode spec of job %s: %w", j.ID, err)
+		return spec, fmt.Errorf("scheduler: decode spec of job %s: %w", j.ID, err)
 	}
-	return spec.Labels, nil
+	return spec, nil
+}
+
+// specLabels reads the labels a job requires from its stored spec.
+func specLabels(j *store.Job) (map[string]string, error) {
+	spec, err := jobSpec(j)
+	return spec.Labels, err
 }
 
 // labelsSubset reports whether every required label is present with the

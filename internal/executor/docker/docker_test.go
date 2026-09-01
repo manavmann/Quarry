@@ -188,6 +188,48 @@ func TestDockerTimeoutKill(t *testing.T) {
 	}
 }
 
+// cancelOn cancels once the container's output contains marker: the way
+// a heartbeat cancel directive or a user cancel reaches a running job.
+type cancelOn struct {
+	syncBuffer
+	marker string
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (c *cancelOn) Write(p []byte) (int, error) {
+	n, err := c.syncBuffer.Write(p)
+	if strings.Contains(c.String(), c.marker) {
+		c.once.Do(c.cancel)
+	}
+	return n, err
+}
+
+// Cancellation mid-run kills the container exactly like a timeout does:
+// Run returns context.Canceled promptly, the script does not continue,
+// and nothing is left behind.
+func TestDockerCancelKill(t *testing.T) {
+	e := newExec(t, Config{})
+	defer assertClean(t, e)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logs := &cancelOn{marker: "started\n", cancel: cancel}
+	start := time.Now()
+	res, err := e.Run(ctx, spec("job5", "echo started", "sleep 60", "echo unreachable"), logs)
+	t.Logf("logs:\n%s", logs.String())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v (res %+v), want Canceled", err, res)
+	}
+	if took := time.Since(start); took > 20*time.Second {
+		t.Fatalf("Run took %v after cancel; kill did not happen", took)
+	}
+	mustContain(t, logs.String(), "started\n")
+	if strings.Contains(logs.String(), "unreachable") {
+		t.Error("container ran on after kill")
+	}
+}
+
 func TestDockerSourceVisibleInWorkspace(t *testing.T) {
 	e := newExec(t, Config{Source: sourceTar(map[string]string{
 		"hello.txt":      "hello from the bundle\n",
