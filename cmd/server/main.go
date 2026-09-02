@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -115,19 +116,25 @@ func run(logger *log.Logger) error {
 		return err
 	}
 	defer st.Close()
+	if err := logStateCounts(ctx, st, logger); err != nil {
+		return err
+	}
 	blobs, err := local.New(cfg.blobDir)
 	if err != nil {
 		return err
 	}
 
+	ln, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
 	h := api.New(st, api.Config{
 		APIToken: cfg.apiToken, Logger: logger,
 		Scheduler: scheduler.Config{LeaseTTL: cfg.leaseTTL, LogCapBytes: cfg.logCap, MaxAttempts: cfg.maxAtt},
 		Artifacts: blobs,
 	})
 	srv := &http.Server{Addr: cfg.listen, Handler: h, ReadHeaderTimeout: 10 * time.Second}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
 	// The lease monitor stops with ctx; wait for it before the store closes.
 	monDone := make(chan struct{})
 	go func() {
@@ -136,7 +143,23 @@ func run(logger *log.Logger) error {
 	}()
 	defer func() { stop(); <-monDone }()
 	logger.Printf("%s listening on %s (db %s, artifacts %s, lease ttl %s, max attempts %d)", version.String("server"), cfg.listen, cfg.dbPath, blobs.Root(), cfg.leaseTTL, cfg.maxAtt)
+	return serve(ctx, srv, ln, logger)
+}
 
+func logStateCounts(ctx context.Context, st *store.Store, logger *log.Logger) error {
+	counts, err := st.StateCounts(ctx)
+	if err != nil {
+		return fmt.Errorf("startup state counts: %w", err)
+	}
+	logger.Printf("startup states: runs=%v jobs=%v runners=%v", counts["runs"], counts["jobs"], counts["runners"])
+	return nil
+}
+
+// serve owns the serving goroutine and drains requests before the caller
+// closes SQLite. Request contexts are independent of the signal context.
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, logger *log.Logger) error {
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
 	select {
 	case err := <-errc:
 		return err
@@ -146,6 +169,8 @@ func run(logger *log.Logger) error {
 	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(sctx); err != nil {
+		_ = srv.Close()
+		<-errc
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	<-errc // ListenAndServe returns ErrServerClosed once Shutdown begins.

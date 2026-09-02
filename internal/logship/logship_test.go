@@ -8,8 +8,57 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestConnectionRetryBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var calls []time.Time
+		s := New(Config{FlushInterval: time.Hour, Backoff: time.Second}, func(ctx context.Context, chunks []Chunk) error {
+			calls = append(calls, time.Now())
+			if len(chunks) != 1 || chunks[0].Seq != 1 || string(chunks[0].Data) != "tail" {
+				t.Fatalf("batch changed: %+v", chunks)
+			}
+			if len(calls) <= 10 {
+				return errors.New("connection refused")
+			}
+			return nil
+		})
+		s.Write([]byte("tail"))
+		if err := s.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 11 {
+			t.Fatalf("calls = %d", len(calls))
+		}
+		delay := time.Second
+		for i := 1; i < len(calls); i++ {
+			if got := calls[i].Sub(calls[i-1]); got != delay {
+				t.Fatalf("retry %d delay=%s want=%s", i, got, delay)
+			}
+			delay = min(delay*2, 10*time.Second)
+		}
+	})
+}
+
+func TestCloseCancelsInFlightConnection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered := make(chan struct{})
+		s := New(Config{FlushBytes: 1}, func(ctx context.Context, _ []Chunk) error {
+			close(entered)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		s.Write([]byte("x"))
+		<-entered
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := s.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close = %v", err)
+		}
+	})
+}
 
 // recorder is a scripted Sink: it records every call and answers from a
 // queue of errors (nil once the queue is empty).

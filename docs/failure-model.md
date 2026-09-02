@@ -35,7 +35,7 @@ server rejects it with 400.
 | every attempt loses its lease            | at the cap the monitor writes `failed(lost_runner)` and cascades                                                      | `failed (lost_runner)`, dependents `skipped`                     | `TestLostRunnerExhaustsAttempts` |
 | lost runner comes back                   | its heartbeat gets `abort`; its late `complete`/logs/artifacts get 409; it kills the container and forgets the attempt | nothing — the newer attempt's result stands                      | `TestLostRunnerJobIsReassigned`, scheduler `TestTickRequeuesExpiredLease…` |
 | runner silent for 30 s                   | `offline` in `GET /api/runners`; any claim or heartbeat makes it `online` again                                       | `quarry runners` shows `offline`                                 | `TestSilentRunnerGoesOffline` |
-| control plane restarts                   | leases and queue are in SQLite; runners retry with backoff; the monitor resumes on the next tick                      | a pause, no lost work                                            | compose: `run survives compose restart server` (C11) |
+| control plane restarts                   | SQLite preserves jobs, attempts and leases; shutdown drains requests; startup logs state counts and defers lease expiry for one full lease TTL, including leases that expired during downtime; live runners renew before reassignment. Agent, shipper and CLI connection errors retry until recovery or cancellation with exponential backoff capped at 10 s | a pause; the original attempts finish once; `watch` resumes and `logs -f` retains its cursor | `TestServerRestartMidRun`, `TestServerRestartAfterLeaseTTL`, cli `TestWatchReconnect`, `TestLogsFollowReconnectCursor` |
 | user runs `quarry cancel`                | jobs not yet started → `cancelled` at once; running attempts get `cancel` on the next heartbeat (≤ 5 s), the executor context is cancelled, the container killed, the attempt reported `failed(cancelled)` → job `cancelled`; run `cancelled` (or `failed` if a job had already failed) | `cancelled` rows, `job.cancel_requested` / `job.cancelled` events, `watch` exits 1 | `TestCancelPropagatesWithinOneHeartbeat`, cli `TestCancelEndToEnd` |
 | a step outruns its `timeout`             | the runner's executor context expires: container killed, `failed(timeout)`, dependents `skipped`, never retried             | `failed (timeout)`, attempt 1/3                                  | `TestJobTimeoutIsEnforcedByRunner`, docker `TestDockerTimeoutKill` |
 | a runner fails to enforce the timeout    | the monitor sees `started_at + timeout + 30 s < now` and asks for a cancel (`reason: timeout`); the runner kills the job on its next heartbeat and its `cancelled` report is stored as `failed(timeout)` | `job.cancel_requested {reason: timeout}`, then `failed (timeout)` | `TestTimeoutBackstopCancelsThroughHeartbeat` |
@@ -45,7 +45,7 @@ server rejects it with 400.
 One goroutine on the server (`scheduler.RunMonitor`, owned by `cmd/server`
 `run()`), ticking every 5 s. Each tick is one transaction:
 
-1. every `running` job with `lease_expires_at < now` → `queued`
+1. after one lease TTL from this server's startup, every `running` job with `lease_expires_at < now` → `queued`
    (`attempt < max_attempts`) or `failed(lost_runner)` + DAG advancement;
 2. every `running` job past `started_at + timeout + 30 s` with no cancel
    pending gets a cancel request (`reason: timeout`) for its next heartbeat;
@@ -54,6 +54,20 @@ One goroutine on the server (`scheduler.RunMonitor`, owned by `cmd/server`
 A tick never selects what the previous tick changed, so it is idempotent,
 and it reads time only from the store's injected clock — the harness
 drives it with a fake clock and a 10 ms ticker.
+
+The startup deadline is recreated from the injected clock on every boot;
+it does not recover or cache job state. Only lease expiry is deferred:
+timeout backstops and runner-offline detection still run during grace.
+After grace, leases that were not renewed expire normally. No startup
+transition requeues a job merely because its old lease expired while the
+server was down.
+
+Connection loss does not consume the agent's completion/upload HTTP-error
+budget or the CLI's gateway-response budget. Final logs and completion
+wait while the runner is alive; runner shutdown bounds delivery by
+`LogFlushTimeout` (30 s by default). Source and artifact downloads restart
+into temporary files after interrupted reads, before exposing bytes to the
+consumer. HTTP fencing, permanent rejections, and job timeouts still apply.
 
 ## Timing
 

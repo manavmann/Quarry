@@ -26,7 +26,7 @@ const (
 	DefaultMaxPostBytes  = 512 << 10
 	DefaultMaxBuffered   = 16 << 20
 	DefaultBackoff       = 200 * time.Millisecond
-	maxBackoff           = 5 * time.Second
+	maxBackoff           = 10 * time.Second
 )
 
 // Chunk is one contiguous piece of an attempt's output. Seq is 1-based
@@ -66,7 +66,7 @@ type Config struct {
 	// stream once room returns.
 	MaxBuffered int
 	// Backoff is the first retry delay after a transient send failure;
-	// it doubles up to 5 s.
+	// it doubles up to 10 s.
 	Backoff time.Duration
 	// OnStale is called once, from the flush loop, when a send returns
 	// ErrStale. The agent uses it to kill the attempt.
@@ -115,6 +115,7 @@ func New(cfg Config, send Sink) *Shipper {
 	if cfg.Backoff <= 0 {
 		cfg.Backoff = DefaultBackoff
 	}
+	cfg.Backoff = min(cfg.Backoff, maxBackoff)
 	s := &Shipper{
 		cfg: cfg, send: send, nextSeq: 1,
 		kick: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{}),
@@ -211,23 +212,26 @@ func (s *Shipper) ack(n int) {
 // final flush under Close's context and exits.
 func (s *Shipper) loop() {
 	defer close(s.done)
+	defer s.cancelRun()
 	t := time.NewTicker(s.cfg.FlushInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-s.stop:
-			s.mu.Lock()
-			ctx := s.closeCtx
-			s.mu.Unlock()
-			s.drain(ctx, true)
-			return
 		case <-s.runCtx.Done():
-			<-s.stop // stale: nothing more to send, wait for Close
-			return
+			<-s.stop
 		case <-t.C:
+			s.drain(s.runCtx, false)
+			continue
 		case <-s.kick:
+			s.drain(s.runCtx, false)
+			continue
 		}
-		s.drain(s.runCtx, false)
+		s.mu.Lock()
+		ctx := s.closeCtx
+		s.mu.Unlock()
+		s.drain(ctx, true)
+		return
 	}
 }
 
@@ -314,6 +318,10 @@ func (s *Shipper) Close(ctx context.Context) error {
 		s.closed = true
 		s.closeCtx = ctx
 		s.mu.Unlock()
+		// A deadline interrupts a stuck send. Let an otherwise healthy
+		// in-flight acknowledgement finish before the final flush takes over.
+		stopCancel := context.AfterFunc(ctx, s.cancelRun)
+		defer stopCancel()
 		close(s.stop)
 	} else {
 		s.mu.Unlock()

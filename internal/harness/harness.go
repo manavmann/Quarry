@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -69,16 +70,18 @@ type Opts struct {
 // from the test goroutine except Client, Clock and the executors, which
 // are safe from anywhere.
 type Harness struct {
-	t     *testing.T
-	opts  Opts
-	log   *log.Logger
-	st    *store.Store
-	srv   *httptest.Server
-	http  *http.Client
-	clock *Clock
-	blobs *faultStore
-	execs []*executor.FakeExecutor
-	ags   []*runner
+	t      *testing.T
+	opts   Opts
+	log    *log.Logger
+	st     *store.Store
+	dbPath string
+	url    string // immutable across restarts, safe for concurrent clients
+	srv    *httptest.Server
+	http   *http.Client
+	clock  *Clock
+	blobs  *faultStore
+	execs  []*executor.FakeExecutor
+	ags    []*runner
 	// The lease monitor goroutine is owned by the Harness: started in New,
 	// stopped in close before the server.
 	stopMon context.CancelFunc
@@ -142,40 +145,13 @@ func New(t *testing.T, opts Opts) *Harness {
 	dir := t.TempDir()
 	t.Cleanup(h.close)
 
-	st, err := store.Open(context.Background(), filepath.Join(dir, "quarry.db"), store.WithClock(h.clock.Now))
-	if err != nil {
-		t.Fatalf("harness: open store: %v", err)
-	}
-	h.st = st
+	h.dbPath = filepath.Join(dir, "quarry.db")
 	blobs, err := local.New(filepath.Join(dir, "blobs"))
 	if err != nil {
 		t.Fatalf("harness: open artifact store: %v", err)
 	}
 	h.blobs = &faultStore{Store: blobs}
-	srv := api.New(st, api.Config{
-		APIToken: Token, Logger: h.log, Artifacts: h.blobs,
-		Scheduler: scheduler.Config{
-			LeaseTTL: opts.LeaseTTL, MaxAttempts: opts.MaxAttempts,
-			MonitorInterval: opts.MonitorInterval, RunnerOfflineAfter: opts.RunnerOfflineAfter,
-		},
-	})
-	h.srv = httptest.NewServer(srv)
-	mctx, stopMon := context.WithCancel(context.Background())
-	monDone := make(chan struct{})
-	h.stopMon, h.monDone = stopMon, monDone
-	go func() {
-		defer close(monDone)
-		srv.RunMonitor(mctx)
-	}()
-	WaitFor(t, func() bool {
-		resp, err := h.http.Get(h.srv.URL + "/healthz")
-		if err != nil {
-			return false
-		}
-		resp.Body.Close()
-		return resp.StatusCode == http.StatusOK
-	}, "server healthy")
-
+	h.StartServer()
 	for i := 0; i < opts.Agents; i++ {
 		r := &runner{name: "agent-" + strconv.Itoa(i), exec: executor.NewFake(), net: &agentTransport{}}
 		h.ags = append(h.ags, r)
@@ -185,23 +161,84 @@ func New(t *testing.T, opts Opts) *Harness {
 	return h
 }
 
+// StartServer reopens the same database and address with fresh server state.
+// Runners and their executors remain alive across StopServer/StartServer.
+func (h *Harness) StartServer() {
+	h.t.Helper()
+	if h.st != nil {
+		h.t.Fatal("harness: server already running")
+	}
+	st, err := store.Open(context.Background(), h.dbPath, store.WithClock(h.clock.Now))
+	if err != nil {
+		h.t.Fatalf("harness: open store: %v", err)
+	}
+	h.st = st
+	opts := h.opts
+	srv := api.New(st, api.Config{
+		APIToken: Token, Logger: h.log, Artifacts: h.blobs,
+		Scheduler: scheduler.Config{
+			LeaseTTL: opts.LeaseTTL, MaxAttempts: opts.MaxAttempts,
+			MonitorInterval: opts.MonitorInterval, RunnerOfflineAfter: opts.RunnerOfflineAfter,
+		},
+	})
+	addr := "127.0.0.1:0"
+	if h.url != "" {
+		addr = strings.TrimPrefix(h.url, "http://")
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		h.t.Fatalf("harness: listen: %v", err)
+	}
+	h.srv = httptest.NewUnstartedServer(srv)
+	h.srv.Listener.Close()
+	h.srv.Listener = ln
+	h.srv.Start()
+	if h.url == "" {
+		h.url = h.srv.URL
+	}
+	mctx, stopMon := context.WithCancel(context.Background())
+	monDone := make(chan struct{})
+	h.stopMon, h.monDone = stopMon, monDone
+	go func() {
+		defer close(monDone)
+		srv.RunMonitor(mctx)
+	}()
+	WaitFor(h.t, func() bool {
+		resp, err := h.http.Get(h.url + "/healthz")
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, "server healthy")
+
+}
+
 // close stops agents first so nothing is mid-request when the server
 // goes, then the monitor, then the server, then the store.
 func (h *Harness) close() {
 	for i := range h.ags {
 		h.stopAgent(i)
 	}
+	h.StopServer()
+}
+
+// StopServer joins the monitor, drains requests, and closes SQLite.
+func (h *Harness) StopServer() {
 	if h.stopMon != nil {
 		h.stopMon()
 		<-h.monDone
+		h.stopMon = nil
 	}
 	if h.srv != nil {
 		h.srv.Close()
+		h.srv = nil
 	}
 	if h.st != nil {
 		if err := h.st.Close(); err != nil {
 			h.t.Errorf("harness: close store: %v", err)
 		}
+		h.st = nil
 	}
 }
 
@@ -213,11 +250,12 @@ func (h *Harness) startAgent(i int) {
 		labels = h.opts.Labels(i)
 	}
 	a, err := agent.New(agent.Config{
-		ServerURL: h.srv.URL, Token: Token, Name: r.name, Labels: labels,
+		ServerURL: h.url, Token: Token, Name: r.name, Labels: labels,
 		Capacity: h.opts.Capacity, Version: "harness",
 		PollInterval: h.opts.PollInterval, HeartbeatInterval: h.opts.HeartbeatInterval,
 		CompleteBackoff: h.opts.CompleteBackoff, Logger: h.log,
-		HTTPClient: &http.Client{Timeout: h.http.Timeout, Transport: r.net},
+		LogFlushTimeout: time.Second,
+		HTTPClient:      &http.Client{Timeout: h.http.Timeout, Transport: r.net},
 	}, r.exec)
 	if err != nil {
 		h.t.Fatalf("harness: agent %d: %v", i, err)
@@ -336,7 +374,7 @@ func (h *Harness) Clock() *Clock { return h.clock }
 func (h *Harness) Store() *store.Store { return h.st }
 
 // URL is the server's base URL.
-func (h *Harness) URL() string { return h.srv.URL }
+func (h *Harness) URL() string { return h.url }
 
 // Client talks to the running server over HTTP with the harness token.
 func (h *Harness) Client() *Client { return &Client{h: h} }
@@ -395,7 +433,7 @@ type Client struct{ h *Harness }
 
 // do sends one request and decodes a 2xx JSON body into out.
 func (c *Client) do(method, path, body string, out any) error {
-	req, err := http.NewRequest(method, c.h.srv.URL+path, strings.NewReader(body))
+	req, err := http.NewRequest(method, c.h.url+path, strings.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -657,7 +695,7 @@ func (c *Client) Artifacts(id string) ([]Artifact, error) {
 
 // Download fetches one artifact of job id's current attempt.
 func (c *Client) Download(id, path string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, c.h.srv.URL+"/api/jobs/"+id+"/artifacts/"+path, nil)
+	req, err := http.NewRequest(http.MethodGet, c.h.url+"/api/jobs/"+id+"/artifacts/"+path, nil)
 	if err != nil {
 		return nil, err
 	}

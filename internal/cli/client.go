@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -118,8 +119,8 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
-	// Retries is the number of attempts after the first; Backoff the first
-	// delay, doubled per attempt and capped at 8×.
+	// Retries bounds gateway HTTP errors only. Connection errors retry until
+	// context cancellation. Backoff doubles up to 10 seconds.
 	Retries int
 	Backoff time.Duration
 }
@@ -133,20 +134,41 @@ func NewClient(baseURL, token string) *Client {
 // do performs one request per attempt; body, when non-nil, is called per
 // attempt so retries send a fresh body. out receives the decoded 2xx JSON.
 func (c *Client) do(ctx context.Context, method, path string, body func() (io.ReadCloser, string, error), out any) error {
-	delay := c.Backoff
-	for attempt := 0; ; attempt++ {
-		err := c.once(ctx, method, path, body, out)
-		if err == nil || attempt >= c.Retries || !transient(err) {
+	return c.retry(ctx, func() error { return c.once(ctx, method, path, body, out) })
+}
+
+const maxBackoff = 10 * time.Second
+
+type connectionError struct{ error }
+
+func (e *connectionError) Unwrap() error { return e.error }
+
+func (c *Client) retry(ctx context.Context, call func() error) error {
+	delay := min(c.Backoff, maxBackoff)
+	if delay <= 0 {
+		delay = 200 * time.Millisecond
+	}
+	for failures := 0; ; {
+		if err := ctx.Err(); err != nil {
 			return err
+		}
+		err := call()
+		if err == nil || !transient(err) {
+			return err
+		}
+		var api *APIError
+		if errors.As(err, &api) {
+			if failures >= c.Retries {
+				return err
+			}
+			failures++
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(delay):
 		}
-		if delay < 8*c.Backoff {
-			delay *= 2
-		}
+		delay = min(delay*2, maxBackoff)
 	}
 }
 
@@ -172,12 +194,12 @@ func (c *Client) once(ctx context.Context, method, path string, body func() (io.
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return &connectionError{err}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return err
+		return &connectionError{err}
 	}
 	if resp.StatusCode/100 != 2 {
 		e := &APIError{Status: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
@@ -202,6 +224,10 @@ func (c *Client) once(ctx context.Context, method, path string, body func() (io.
 // transient reports whether an error is worth retrying: anything from the
 // transport (refused, reset, timeout) and a gateway-style 5xx.
 func transient(err error) bool {
+	var conn *connectionError
+	if errors.As(err, &conn) {
+		return true
+	}
 	var api *APIError
 	if errors.As(err, &api) {
 		return api.Status == http.StatusBadGateway || api.Status == http.StatusServiceUnavailable || api.Status == http.StatusGatewayTimeout
@@ -315,9 +341,48 @@ func (c *Client) ListArtifacts(ctx context.Context, jobID string, attempt int) (
 }
 
 // DownloadArtifact streams one artifact into w and returns the sha256 of
-// what was written, computed as it streams. It is a single request: a
-// partial write is not retried, the caller sees the error.
+// what was written. Spooling allows a broken download to restart without
+// duplicating bytes in w; local writer errors remain final.
 func (c *Client) DownloadArtifact(ctx context.Context, jobID string, attempt int, path string, w io.Writer) (string, error) {
+	f, err := os.CreateTemp("", "quarry-download-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	var sum string
+	err = c.retry(ctx, func() error {
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		var err error
+		sum, err = c.downloadOnce(ctx, jobID, attempt, path, f)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	_, err = io.Copy(w, f)
+	return sum, err
+}
+
+type connectionReader struct{ io.Reader }
+
+func (r connectionReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		err = &connectionError{err}
+	}
+	return n, err
+}
+
+func (c *Client) downloadOnce(ctx context.Context, jobID string, attempt int, path string, w io.Writer) (string, error) {
 	segs := strings.Split(path, "/")
 	for i, s := range segs {
 		segs[i] = url.PathEscape(s)
@@ -333,7 +398,7 @@ func (c *Client) DownloadArtifact(ctx context.Context, jobID string, attempt int
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", err
+		return "", &connectionError{err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
@@ -349,7 +414,7 @@ func (c *Client) DownloadArtifact(ctx context.Context, jobID string, attempt int
 		return "", e
 	}
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(w, h), resp.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(w, h), connectionReader{resp.Body}); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

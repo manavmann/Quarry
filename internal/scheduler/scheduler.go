@@ -90,6 +90,8 @@ type Scheduler struct {
 	monitorEach time.Duration
 	offlineMS   int64 // milliseconds
 	graceMS     int64 // milliseconds
+	// Recreated on every boot; no job/lease state is recovered from memory.
+	leaseGraceUntil int64
 }
 
 // New builds a Scheduler over st.
@@ -115,7 +117,8 @@ func New(st *store.Store, cfg Config) *Scheduler {
 	return &Scheduler{
 		st: st, ttl: cfg.LeaseTTL.Milliseconds(), logCap: cfg.LogCapBytes, maxAttempts: cfg.MaxAttempts,
 		monitorEach: cfg.MonitorInterval, offlineMS: cfg.RunnerOfflineAfter.Milliseconds(),
-		graceMS: cfg.TimeoutGrace.Milliseconds(),
+		graceMS:         cfg.TimeoutGrace.Milliseconds(),
+		leaseGraceUntil: st.Now() + cfg.LeaseTTL.Milliseconds(),
 	}
 }
 

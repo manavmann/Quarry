@@ -109,16 +109,59 @@ func (e *statusError) Retryable() bool { return e.Code >= 500 }
 // errFenced is a 409 on complete: the attempt is no longer ours.
 var errFenced = errors.New("agent: attempt is not the running attempt (409)")
 
-// client is the agent's HTTP face. Every method is one request.
+// client is the agent's HTTP face. Connection failures retry until ctx ends;
+// HTTP replies retain each caller's existing status/fencing policy.
 type client struct {
-	base  string
-	token string
-	http  *http.Client
+	base    string
+	token   string
+	http    *http.Client
+	backoff time.Duration
+}
+
+// connectionError distinguishes network I/O from HTTP and local-file errors.
+type connectionError struct{ error }
+
+func (e *connectionError) Unwrap() error { return e.error }
+
+func (c *client) reconnect(ctx context.Context, call func() error) error {
+	delay := c.backoff
+	if delay <= 0 {
+		delay = DefaultCompleteBackoff
+	}
+	delay = min(delay, maxCompleteBackoff)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := call()
+		var conn *connectionError
+		if !errors.As(err, &conn) {
+			return err
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+		delay = min(delay*2, maxCompleteBackoff)
+	}
 }
 
 // post sends v as JSON and decodes a 2xx body into out (when non-nil).
 // A 204 leaves out untouched and returns (false, nil).
 func (c *client) post(ctx context.Context, path string, v, out any) (bool, error) {
+	var ok bool
+	err := c.reconnect(ctx, func() error {
+		var err error
+		ok, err = c.postOnce(ctx, path, v, out)
+		return err
+	})
+	return ok, err
+}
+
+func (c *client) postOnce(ctx context.Context, path string, v, out any) (bool, error) {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return false, err
@@ -131,12 +174,12 @@ func (c *client) post(ctx context.Context, path string, v, out any) (bool, error
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return false, err
+		return false, &connectionError{err}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return false, err
+		return false, &connectionError{err}
 	}
 	switch {
 	case resp.StatusCode == http.StatusNoContent:
@@ -204,7 +247,8 @@ func (c *client) complete(ctx context.Context, jobID string, req completeRequest
 // the shipper's contract: 409 → logship.ErrStale, any other 4xx →
 // logship.ErrRejected, transport errors and 5xx as they are (retried).
 func (c *client) logs(ctx context.Context, jobID string, req logsRequest) error {
-	_, err := c.post(ctx, "/api/runner/jobs/"+jobID+"/logs", req, nil)
+	// The shipper owns reconnect pacing and cancellation during Close.
+	_, err := c.postOnce(ctx, "/api/runner/jobs/"+jobID+"/logs", req, nil)
 	var se *statusError
 	switch {
 	case err == nil:
@@ -218,9 +262,12 @@ func (c *client) logs(ctx context.Context, jobID string, req logsRequest) error 
 }
 
 // completeWithRetry resends complete on transport errors and 5xx replies
-// with exponential backoff, up to attempts tries. Any other outcome is
+// with exponential backoff. Only HTTP/server failures consume attempts;
+// connection failures wait inside post until recovery or cancellation.
+// Any other outcome is
 // final: the server either accepted the result or will never accept it.
 func (c *client) completeWithRetry(ctx context.Context, jobID string, req completeRequest, attempts int, backoff time.Duration) error {
+	backoff = min(backoff, maxCompleteBackoff)
 	var err error
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
@@ -256,12 +303,71 @@ func (c *client) completeWithRetry(ctx context.Context, jobID string, req comple
 // (nil, nil) so the job runs in an empty workspace.
 func SourceFetcher(cfg Config) func(ctx context.Context, runID string) (io.ReadCloser, error) {
 	// Bundles can be large: no client timeout, the job context bounds it.
-	c := &client{base: cfg.ServerURL, token: cfg.Token, http: &http.Client{}}
+	hc := cfg.HTTPClient
+	if hc == nil {
+		hc = &http.Client{}
+	}
+	c := &client{base: cfg.ServerURL, token: cfg.Token, http: hc, backoff: cfg.CompleteBackoff}
 	return c.source
 }
 
-// source is one GET of the run's bundle. The caller closes the body.
+// source spools before exposing bytes to the executor so a reset halfway
+// through a source download can safely restart the GET. Close removes it.
 func (c *client) source(ctx context.Context, runID string) (io.ReadCloser, error) {
+	f, err := os.CreateTemp("", "quarry-source-*")
+	if err != nil {
+		return nil, err
+	}
+	out := &sourceFile{f}
+	found := false
+	err = c.reconnect(ctx, func() error {
+		found = false
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		body, err := c.sourceOnce(ctx, runID)
+		if err != nil || body == nil {
+			return err
+		}
+		defer body.Close()
+		found = true
+		// Wrap only reads: a local disk failure must not retry forever.
+		_, err = io.Copy(f, connectionReader{body})
+		return err
+	})
+	if err != nil || !found {
+		out.Close()
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		out.Close()
+		return nil, err
+	}
+	return out, nil
+}
+
+type sourceFile struct{ *os.File }
+
+func (f *sourceFile) Close() error {
+	err := f.File.Close()
+	_ = os.Remove(f.Name())
+	return err
+}
+
+type connectionReader struct{ io.Reader }
+
+func (r connectionReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		err = &connectionError{err}
+	}
+	return n, err
+}
+
+func (c *client) sourceOnce(ctx context.Context, runID string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/runs/"+runID+"/source", nil)
 	if err != nil {
 		return nil, err
@@ -269,7 +375,7 @@ func (c *client) source(ctx context.Context, runID string) (io.ReadCloser, error
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &connectionError{err}
 	}
 	switch {
 	case resp.StatusCode == http.StatusOK:
@@ -297,6 +403,12 @@ type artifactReply struct {
 // the same stream and a mismatch with its reply is an error. 409 maps to
 // errFenced; other non-2xx replies are *statusError.
 func (c *client) uploadArtifact(ctx context.Context, jobID string, attempt int, path, file string) error {
+	return c.reconnect(ctx, func() error {
+		return c.uploadArtifactOnce(ctx, jobID, attempt, path, file)
+	})
+}
+
+func (c *client) uploadArtifactOnce(ctx context.Context, jobID string, attempt int, path, file string) error {
 	f, err := os.Open(file)
 	if err != nil {
 		return err
@@ -317,12 +429,12 @@ func (c *client) uploadArtifact(ctx context.Context, jobID string, attempt int, 
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return &connectionError{err}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return err
+		return &connectionError{err}
 	}
 	switch {
 	case resp.StatusCode == http.StatusConflict:

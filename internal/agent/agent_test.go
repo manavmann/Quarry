@@ -2,21 +2,264 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"quarry/internal/executor"
 	"quarry/internal/pipeline"
 )
+
+type reconnectTransport func(*http.Request) (*http.Response, error)
+
+func (f reconnectTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func reconnectReply(body string) *http.Response {
+	return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func TestAgentConnectionBackoff(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "artifact")
+	if err := os.WriteFile(file, []byte("artifact"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"register", "claim", "heartbeat", "complete", "source", "artifact"} {
+		t.Run(endpoint, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var calls []time.Time
+				c := &client{base: "http://server", backoff: 500 * time.Millisecond}
+				c.http = &http.Client{Transport: reconnectTransport(func(r *http.Request) (*http.Response, error) {
+					if r.Body != nil {
+						defer r.Body.Close()
+						io.Copy(io.Discard, r.Body)
+					}
+					calls = append(calls, time.Now())
+					if len(calls) <= 10 {
+						return nil, errors.New("connection refused")
+					}
+					switch endpoint {
+					case "register":
+						return reconnectReply(`{"runner_id":"r"}`), nil
+					case "claim":
+						return reconnectReply(`{"job":{"id":"j","attempt":1}}`), nil
+					case "heartbeat":
+						return reconnectReply(`{"jobs":[{"job_id":"j","attempt":1,"directive":"continue"}]}`), nil
+					case "artifact":
+						b, _ := json.Marshal(artifactReply{SizeBytes: 8, SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("artifact")))})
+						return reconnectReply(string(b)), nil
+					case "source":
+						return reconnectReply("bundle"), nil
+					default:
+						return reconnectReply("{}"), nil
+					}
+				})}
+				var err error
+				switch endpoint {
+				case "register":
+					_, err = c.register(t.Context(), registerRequest{Name: "r"})
+				case "claim":
+					_, err = c.claim(t.Context(), claimRequest{RunnerID: "r"})
+				case "heartbeat":
+					_, err = c.heartbeat(t.Context(), "r", []jobRef{{JobID: "j", Attempt: 1}})
+				case "complete":
+					err = c.completeWithRetry(t.Context(), "j", completeRequest{Attempt: 1, Status: statusSucceeded}, 1, time.Millisecond)
+				case "artifact":
+					err = c.uploadArtifact(t.Context(), "j", 1, "out", file)
+				case "source":
+					var body io.ReadCloser
+					body, err = c.source(t.Context(), "r")
+					if err == nil {
+						b, readErr := io.ReadAll(body)
+						err = readErr
+						body.Close()
+						if string(b) != "bundle" {
+							t.Fatalf("source = %q", b)
+						}
+					}
+				}
+				if err != nil || len(calls) != 11 {
+					t.Fatalf("calls=%d err=%v", len(calls), err)
+				}
+				delay := 500 * time.Millisecond
+				for i := 1; i < len(calls); i++ {
+					if got := calls[i].Sub(calls[i-1]); got != delay {
+						t.Fatalf("retry %d delay=%s want=%s", i, got, delay)
+					}
+					delay = min(delay*2, 10*time.Second)
+				}
+			})
+		})
+	}
+	t.Run("cancel and initial cap", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			c := &client{backoff: time.Hour}
+			start, calls := time.Now(), 0
+			err := c.reconnect(ctx, func() error {
+				calls++
+				if calls == 2 {
+					cancel()
+				}
+				return &connectionError{io.ErrUnexpectedEOF}
+			})
+			if !errors.Is(err, context.Canceled) || calls != 2 || time.Since(start) != 10*time.Second {
+				t.Fatalf("cancel: err=%v calls=%d elapsed=%s", err, calls, time.Since(start))
+			}
+		})
+	})
+}
+
+type brokenRead struct{}
+
+func TestAgentShutdownDuringOutage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		failed := make(chan struct{})
+		var once sync.Once
+		claimed := false
+		hc := &http.Client{Transport: reconnectTransport(func(r *http.Request) (*http.Response, error) {
+			if r.Body != nil {
+				defer r.Body.Close()
+			}
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/register"):
+				return reconnectReply(`{"runner_id":"r"}`), nil
+			case strings.HasSuffix(r.URL.Path, "/claim"):
+				if claimed {
+					resp := reconnectReply("")
+					resp.StatusCode = 204
+					return resp, nil
+				}
+				claimed = true
+				return reconnectReply(`{"job":{"id":"j","run_id":"r","attempt":1,"spec":{"name":"build"}}}`), nil
+			case strings.HasSuffix(r.URL.Path, "/complete"):
+				once.Do(func() { close(failed) })
+				return nil, errors.New("server down")
+			default:
+				return reconnectReply("{}"), nil
+			}
+		})}
+		a, err := New(Config{ServerURL: "http://server", Name: "r", HTTPClient: hc, LogFlushTimeout: time.Second, Logger: log.New(io.Discard, "", 0)}, executor.NewFake())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- a.Run(ctx) }()
+		<-failed
+		start := time.Now()
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if elapsed := time.Since(start); elapsed != time.Second {
+			t.Fatalf("shutdown drain took %s", elapsed)
+		}
+	})
+}
+
+func (brokenRead) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestAgentSourceReconnectAfterPartialRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		c := &client{base: "http://server", http: &http.Client{Transport: reconnectTransport(func(*http.Request) (*http.Response, error) {
+			calls++
+			resp := reconnectReply("whole bundle")
+			if calls == 1 {
+				resp.Body = io.NopCloser(io.MultiReader(strings.NewReader("whole"), brokenRead{}))
+			}
+			return resp, nil
+		})}}
+		body, err := c.source(t.Context(), "r")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := body.(*sourceFile).Name()
+		b, err := io.ReadAll(body)
+		body.Close()
+		if err != nil || string(b) != "whole bundle" || calls != 2 {
+			t.Fatalf("body=%q err=%v calls=%d", b, err, calls)
+		}
+		if _, err := os.Stat(name); !os.IsNotExist(err) {
+			t.Fatalf("source spool not removed: %v", err)
+		}
+	})
+}
+
+func TestAgentDeliverySurvivesConnectionLoss(t *testing.T) {
+	for _, endpoint := range []string{"/logs", "/complete", "/artifacts/out"} {
+		t.Run(endpoint, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := time.Now()
+				claimed := false
+				completed := make(chan completeRequest, 1)
+				hc := &http.Client{Transport: reconnectTransport(func(r *http.Request) (*http.Response, error) {
+					if r.Body != nil {
+						defer r.Body.Close()
+					}
+					if strings.HasSuffix(r.URL.Path, endpoint) && time.Since(start) < time.Minute {
+						return nil, errors.New("server down")
+					}
+					switch {
+					case strings.HasSuffix(r.URL.Path, "/register"):
+						return reconnectReply(`{"runner_id":"r"}`), nil
+					case strings.HasSuffix(r.URL.Path, "/claim"):
+						if claimed {
+							resp := reconnectReply("")
+							resp.StatusCode = 204
+							return resp, nil
+						}
+						claimed = true
+						b, _ := json.Marshal(map[string]any{"job": claimedJob{ID: "j", RunID: "r", Attempt: 1, Spec: json.RawMessage(`{"name":"build","artifacts":["out"]}`)}})
+						return reconnectReply(string(b)), nil
+					case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+						return reconnectReply(`{"jobs":[{"job_id":"j","attempt":1,"directive":"continue"}]}`), nil
+					case strings.HasSuffix(r.URL.Path, "/artifacts/out"):
+						b, _ := io.ReadAll(r.Body)
+						reply, _ := json.Marshal(artifactReply{SizeBytes: int64(len(b)), SHA256: fmt.Sprintf("%x", sha256.Sum256(b))})
+						return reconnectReply(string(reply)), nil
+					case strings.HasSuffix(r.URL.Path, "/complete"):
+						var req completeRequest
+						json.NewDecoder(r.Body).Decode(&req)
+						completed <- req
+					}
+					return reconnectReply("{}"), nil
+				})}
+				f := executor.NewFake()
+				f.Script("build", executor.Outcome{LogBytes: 10, Artifacts: map[string]string{"out": "artifact"}})
+				a, err := New(Config{ServerURL: "http://server", Name: "r", HTTPClient: hc, CompleteRetries: 1, LogFlushTimeout: time.Second, Logger: log.New(io.Discard, "", 0)}, f)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan error, 1)
+				go func() { done <- a.Run(ctx) }()
+				req := <-completed
+				cancel()
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				if req.Status != statusSucceeded || req.Attempt != 1 || time.Since(start) < time.Minute || len(f.Executions()) != 1 {
+					t.Fatalf("completion=%+v elapsed=%s executions=%d", req, time.Since(start), len(f.Executions()))
+				}
+			})
+		})
+	}
+}
 
 // stubServer is a scripted control plane: it registers runners as
 // "id-<name>", hands out queued jobs one per claim, answers heartbeats

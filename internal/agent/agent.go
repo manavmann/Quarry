@@ -68,8 +68,9 @@ type Config struct {
 	CompleteBackoff   time.Duration
 
 	// LogFlushInterval and LogFlushBytes tune the per-attempt log shipper
-	// (logship.Config); LogFlushTimeout bounds the final flush that
-	// precedes complete. Zero values take logship's / the agent's defaults.
+	// (logship.Config); LogFlushTimeout bounds delivery after runner shutdown.
+	// While alive, final flush and completion wait through connection loss.
+	// Zero values take logship's / the agent's defaults.
 	LogFlushInterval time.Duration
 	LogFlushBytes    int
 	LogFlushTimeout  time.Duration
@@ -130,6 +131,7 @@ func New(cfg Config, exec executor.Executor) (*Agent, error) {
 	if cfg.CompleteBackoff <= 0 {
 		cfg.CompleteBackoff = DefaultCompleteBackoff
 	}
+	cfg.CompleteBackoff = min(cfg.CompleteBackoff, maxCompleteBackoff)
 	if cfg.LogFlushTimeout <= 0 {
 		cfg.LogFlushTimeout = DefaultLogFlushTimeout
 	}
@@ -142,7 +144,7 @@ func New(cfg Config, exec executor.Executor) (*Agent, error) {
 	return &Agent{
 		cfg:    cfg,
 		exec:   exec,
-		client: &client{base: cfg.ServerURL, token: cfg.Token, http: cfg.HTTPClient},
+		client: &client{base: cfg.ServerURL, token: cfg.Token, http: cfg.HTTPClient, backoff: cfg.CompleteBackoff},
 		sem:    make(chan struct{}, cfg.Capacity),
 		active: map[attemptKey]context.CancelCauseFunc{},
 	}, nil
@@ -164,6 +166,25 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.register(ctx); err != nil {
 		return err
 	}
+	// Run owns this shutdown watcher. Delivery has no outage deadline while
+	// the runner is alive; after shutdown it gets LogFlushTimeout to drain.
+	deliveryCtx, stopDelivery := context.WithCancel(context.Background())
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		select {
+		case <-deliveryCtx.Done():
+			return
+		case <-ctx.Done():
+		}
+		t := time.NewTimer(a.cfg.LogFlushTimeout)
+		defer t.Stop()
+		select {
+		case <-deliveryCtx.Done():
+		case <-t.C:
+			stopDelivery()
+		}
+	}()
 	// The heartbeat outlives ctx so attempts still draining keep their
 	// leases; it stops once the last job goroutine has reported.
 	hbCtx, stopHB := context.WithCancel(context.Background())
@@ -173,8 +194,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.heartbeatLoop(hbCtx)
 	}()
 
-	a.pollLoop(ctx)
+	a.pollLoop(ctx, deliveryCtx)
 	a.jobs.Wait()
+	stopDelivery()
+	<-drainDone
 	stopHB()
 	<-hbDone
 	return nil
@@ -215,7 +238,7 @@ func (a *Agent) register(ctx context.Context) error {
 // pollLoop claims whenever a capacity slot is free. A successful claim is
 // followed by another attempt at once; an empty reply or an error waits
 // one jittered PollInterval.
-func (a *Agent) pollLoop(ctx context.Context) {
+func (a *Agent) pollLoop(ctx, deliveryCtx context.Context) {
 	req := claimRequest{
 		RunnerID: a.RunnerID(), Name: a.cfg.Name, Labels: a.cfg.Labels,
 		Capacity: a.cfg.Capacity, Version: a.cfg.Version,
@@ -235,7 +258,7 @@ func (a *Agent) pollLoop(ctx context.Context) {
 			}
 			a.cfg.Logger.Printf("claim: %v", err)
 		case job != nil:
-			a.start(ctx, job) // the goroutine releases the slot
+			a.start(ctx, deliveryCtx, job) // the goroutine releases the slot
 			continue
 		default:
 			<-a.sem
@@ -266,19 +289,19 @@ func (a *Agent) wait(ctx context.Context, d time.Duration) bool {
 
 // start spawns the goroutine for one claimed attempt. It owns the
 // capacity slot pollLoop acquired and returns it when the attempt is done.
-func (a *Agent) start(ctx context.Context, job *claimedJob) {
+func (a *Agent) start(ctx, deliveryCtx context.Context, job *claimedJob) {
 	a.jobs.Add(1)
 	go func() {
 		defer a.jobs.Done()
 		defer func() { <-a.sem }()
-		a.runAttempt(ctx, job)
+		a.runAttempt(ctx, deliveryCtx, job)
 	}()
 }
 
 // runAttempt executes one attempt and reports its result. The executor's
 // context is cancelled by timeout, by a heartbeat directive, or by runner
 // shutdown; context.Cause says which, and that decides what is reported.
-func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
+func (a *Agent) runAttempt(ctx, deliveryCtx context.Context, job *claimedJob) {
 	key := attemptKey{job.ID, job.Attempt}
 	logger := a.cfg.Logger
 
@@ -298,7 +321,7 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 	pj, err := job.spec()
 	if err != nil {
 		logger.Printf("job %s attempt %d: %v", job.ID, job.Attempt, err)
-		a.report(job, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: err.Error()})
+		a.report(deliveryCtx, job, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: err.Error()})
 		return
 	}
 	spec := executor.JobSpec{JobID: job.ID, RunID: job.RunID, Attempt: job.Attempt, Job: pj}
@@ -308,7 +331,7 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 		dir, err := os.MkdirTemp("", "quarry-artifacts-")
 		if err != nil {
 			logger.Printf("job %s attempt %d: %v", job.ID, job.Attempt, err)
-			a.report(job, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: "artifact dir: " + err.Error()})
+			a.report(deliveryCtx, job, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: "artifact dir: " + err.Error()})
 			return
 		}
 		defer os.RemoveAll(dir)
@@ -355,7 +378,7 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 	// Flush every buffered chunk synchronously; complete never precedes
 	// the last chunk. An aborted attempt has nothing the server would
 	// accept, so its buffer is just discarded.
-	flushCtx, stopFlush := context.WithTimeout(context.Background(), a.cfg.LogFlushTimeout)
+	flushCtx, stopFlush := context.WithCancel(deliveryCtx)
 	if aborted {
 		stopFlush()
 	}
@@ -389,16 +412,15 @@ func (a *Agent) runAttempt(ctx context.Context, job *claimedJob) {
 	default:
 		req = completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: execErr.Error()}
 	}
-	a.report(job, req)
+	a.report(deliveryCtx, job, req)
 }
 
-// report delivers a completion with retries. It uses its own context so a
-// shutting-down runner still reports what it killed; the bound is the
-// retry budget, not the caller's context.
-func (a *Agent) report(job *claimedJob, req completeRequest) {
+// report uses Run's delivery context so executor cancellation cannot lose
+// a verdict, while runner shutdown still bounds the reconnect wait.
+func (a *Agent) report(ctx context.Context, job *claimedJob, req completeRequest) {
 	req.RunnerID = a.RunnerID()
 	req.Attempt = job.Attempt
-	err := a.client.completeWithRetry(context.Background(), job.ID, req, a.cfg.CompleteRetries, a.cfg.CompleteBackoff)
+	err := a.client.completeWithRetry(ctx, job.ID, req, a.cfg.CompleteRetries, a.cfg.CompleteBackoff)
 	switch {
 	case err == nil:
 	case errors.Is(err, errFenced):

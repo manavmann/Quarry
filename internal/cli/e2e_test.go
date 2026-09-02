@@ -4,15 +4,135 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"quarry/internal/executor"
 	"quarry/internal/harness"
 	"quarry/internal/store"
 )
+
+type reconnectOutput struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (w *reconnectOutput) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Buffer.Write(b)
+}
+func (w *reconnectOutput) text() string { w.mu.Lock(); defer w.mu.Unlock(); return w.Buffer.String() }
+
+func TestWatchReconnect(t *testing.T)            { testCLIReconnect(t, false) }
+func TestLogsFollowReconnectCursor(t *testing.T) { testCLIReconnect(t, true) }
+
+func testCLIReconnect(t *testing.T, logs bool) {
+	h := harness.New(t, harness.Opts{})
+	h.Script("build", executor.Outcome{Hang: true, LogBytes: 100})
+	run := h.Submit(`name: reconnect
+jobs:
+  - name: build
+    image: alpine
+    steps: ["echo hello"]
+`)
+	build := h.WaitJob(run.Run.ID, "build", store.JobRunning)
+	var out reconnectOutput
+	var failures atomic.Int64
+	var resumedAfter atomic.Int64
+	resumedAfter.Store(-1)
+	client := NewClient(h.URL(), harness.Token)
+	client.Backoff = time.Millisecond
+	client.Retries = 1
+	client.HTTP = &http.Client{Transport: reconnectTransport(func(r *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err != nil {
+			failures.Add(1)
+		}
+		if err == nil && failures.Load() > 0 && strings.HasSuffix(r.URL.Path, "/logs") {
+			after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+			resumedAfter.CompareAndSwap(-1, after)
+		}
+		return resp, err
+	})}
+	a := &App{out: &out, err: io.Discard, client: client, interval: time.Millisecond, now: func() int64 { return 0 }}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		if logs {
+			cmd := a.logsCmd()
+			cmd.SetArgs([]string{build.ID, "-f"})
+			done <- cmd.ExecuteContext(ctx)
+		} else {
+			done <- a.watch(ctx, run.Run.ID)
+		}
+	}()
+	harness.WaitFor(t, func() bool {
+		if logs {
+			return len(out.text()) == 100
+		}
+		return strings.Contains(out.text(), "running")
+	}, "CLI initial output")
+	initial := out.text()
+	h.StopServer()
+	harness.WaitFor(t, func() bool { return failures.Load() >= 5 }, "connection retries beyond finite budget")
+	select {
+	case err := <-done:
+		t.Fatalf("CLI exited during outage: %v", err)
+	default:
+	}
+	h.StartServer()
+	if logs {
+		// Existing first chunk was printed before downtime. Append a fenced
+		// tail, then finish; reconnect must print only this new chunk.
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.URL()+"/api/runner/jobs/"+build.ID+"/logs",
+			strings.NewReader(fmt.Sprintf(`{"runner_id":%q,"attempt":1,"chunks":[{"seq":2,"data":"dGFpbAo="}]}`, build.RunnerID)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+harness.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 204 {
+			t.Fatalf("append tail: %d", resp.StatusCode)
+		}
+	}
+	h.Release("build")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if logs {
+		if got := out.text(); got != initial+"tail\n" {
+			t.Fatalf("resumed output=%q", got)
+		}
+		if got := resumedAfter.Load(); got != 1 {
+			t.Fatalf("reconnect cursor=%d want 1", got)
+		}
+	} else if !strings.Contains(out.text(), "succeeded") {
+		t.Fatalf("watch never resumed: %s", out.text())
+	}
+	if got := h.WaitRun(run.Run.ID).Job("build"); got.Attempt != 1 {
+		t.Fatalf("job re-executed: %+v", got)
+	}
+}
 
 // End to end: a job's artifacts travel runner → server → store and
 // `quarry artifacts <job> --download` brings them back byte-for-byte,

@@ -30,9 +30,15 @@ func (s *Scheduler) Tick(ctx context.Context) (TickReport, error) {
 	err := s.st.Tx(ctx, func(tx *sql.Tx) error {
 		rep = TickReport{}
 		now := s.st.Now()
-		expired, err := s.st.ListExpiredLeases(ctx, tx, now)
-		if err != nil {
-			return err
+		// Even leases already expired during downtime get one full TTL for
+		// live runners to renew. Timeout and offline checks still run.
+		var expired []store.Job
+		if now >= s.leaseGraceUntil {
+			var err error
+			expired, err = s.st.ListExpiredLeases(ctx, tx, now)
+			if err != nil {
+				return err
+			}
 		}
 		for i := range expired {
 			job := &expired[i]

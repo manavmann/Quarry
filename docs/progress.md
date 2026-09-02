@@ -2,6 +2,12 @@
 
 Read this first each session. Newest entry on top.
 
+## C15 · server: restart recovery and reconnect — done
+
+- Landed: graceful HTTP drain, SQLite startup state counts, one-TTL lease-expiry grace, connection retries capped at 10 s through agent/shipper/CLI (including final delivery and source/artifact transfers), watch/log cursor resume; fencing unchanged.
+- Verified: targeted suites, `go test -race ./...`, `go vet ./...`, gofmt/diff checks, fake-clock grace boundaries and same-DB restart harness; Compose restart plus 35 s downtime (>30 s TTL) succeeded on attempt 1 with one claim/no requeue, original runner/container, watch/logs exit 0 and no duplicated output.
+- Flaky: none in tests; Compose shared-image build collision avoided by building server and runner-1 once. Next: C16 (not started).
+
 ## C14 · runs: cancellation and job timeouts — done
 
 - Landed: cancel API/CLI, heartbeat directives, per-job timeouts and server backstop; context-first verdicts, idempotent events, no retry after cancellation (including lease expiry), and terminal run finalization.

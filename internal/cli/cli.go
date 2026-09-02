@@ -288,6 +288,7 @@ func (a *App) logsCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			var after int64
+			var readAttempt int
 			for {
 				// Read the job state before the chunks: a terminal state
 				// observed first guarantees the following read sees every
@@ -304,6 +305,13 @@ func (a *App) logsCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				if readAttempt != 0 && l.Attempt != readAttempt {
+					// Sequences belong to attempts. Reconnect retains the
+					// cursor; an actual new attempt starts its own stream.
+					after, readAttempt = 0, l.Attempt
+					continue
+				}
+				readAttempt = l.Attempt
 				for _, c := range l.Chunks {
 					if _, err := a.out.Write(c.Data); err != nil {
 						return err

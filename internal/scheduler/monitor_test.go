@@ -3,12 +3,65 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 
 	"quarry/internal/store"
 )
+
+func TestTickStartupGrace(t *testing.T) {
+	const ttl = 30 * time.Second
+	now := int64(1_700_000_000_000)
+	st, err := store.Open(t.Context(), filepath.Join(t.TempDir(), "quarry.db"), store.WithClock(func() int64 { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s := New(st, Config{LeaseTTL: ttl})
+	_, ids := dag(t, st, []string{"live", "lost"}, map[string]spec{"live": {maxAtt: 3}, "lost": {maxAtt: 3}})
+	live := claim(t, s, "r1", nil)
+	claim(t, s, "r2", nil)
+	now += 2 * ttl.Milliseconds() // downtime already exceeded both leases
+	s = New(st, Config{LeaseTTL: ttl})
+	boot := now
+	rep := tick(t, s)
+	if len(rep.Requeued)+len(rep.Failed) != 0 || len(rep.RunnersOffline) != 2 {
+		t.Fatalf("first boot tick: %+v", rep)
+	}
+	now = boot + ttl.Milliseconds() - 1
+	if rep := tick(t, s); len(rep.Requeued)+len(rep.Failed) != 0 {
+		t.Fatalf("early expiry: %+v", rep)
+	}
+	ds, err := s.Heartbeat(t.Context(), "r1", []JobRef{{JobID: live.ID, Attempt: live.Attempt}})
+	if err != nil || len(ds) != 1 || ds[0].Directive != DirectiveContinue {
+		t.Fatalf("renew: %v %v", ds, err)
+	}
+	now++
+	rep = tick(t, s)
+	if !slices.Equal(rep.Requeued, []string{ids["lost"]}) {
+		t.Fatalf("grace boundary: %+v", rep)
+	}
+	if j := getJob(t, st, ids["live"]); j.State != store.JobRunning || j.Attempt != 1 {
+		t.Fatalf("live job = %+v", j)
+	}
+	if rep := tick(t, s); len(rep.Requeued)+len(rep.Failed) != 0 {
+		t.Fatalf("duplicate expiry: %+v", rep)
+	}
+}
+
+func TestTickStartupGraceKeepsTimeoutBackstop(t *testing.T) {
+	s, st, clk := newScheduler(t, 30*time.Second)
+	_, ids := dag(t, st, []string{"slow"}, map[string]spec{"slow": {timeout: time.Second, maxAtt: 3}})
+	claim(t, s, "r1", nil)
+	clk.ms.Add(time.Minute.Milliseconds())
+	s = New(st, Config{})
+	rep := tick(t, s)
+	if len(rep.Requeued) != 0 || !slices.Equal(rep.TimedOut, []string{ids["slow"]}) {
+		t.Fatalf("timeout during startup grace: %+v", rep)
+	}
+}
 
 func tick(t *testing.T, s *Scheduler) TickReport {
 	t.Helper()
