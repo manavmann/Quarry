@@ -2,6 +2,12 @@
 
 Read this first each session. Newest entry on top.
 
+## C16 · executor/docker: orphan container and volume reaping on startup — done
+
+- Landed: `docker.(*Executor).Reap(ctx, logger)` lists by `quarry.runner=<name>` (containers `All`, then volumes), force-removes containers before volumes, logs each as `quarry-<job>-<attempt> (run <run>)` from the C07 labels plus a found-count line; a list failure is returned, a remove failure is logged and skipped; other runners' remains on the shared daemon are untouched. `cmd/runner` calls it after the signal ctx and before `agent.Run` when the executor is docker (fatal on error). `KeepFailed` skips the reap with a log line so `QUARRY_KEEP_FAILED=1` still keeps remains across a restart. Run/attach/cleanup untouched.
+- Verified: docker-tagged `TestDockerReapOrphans` (running container + volume under own label removed, foreign runner's pair intact, log lines asserted) and `TestDockerReapKeepFailed`; full `make test-docker` suite (24 s) and `go test -race ./...` clean, gofmt/vet clean.
+- Flaky: nothing. Next: C17 (not started). Deviation: reaper is a no-op under `KeepFailed` (entry says reap unconditionally).
+
 ## C15 · server: restart recovery and reconnect — done
 
 - Landed: graceful HTTP drain, SQLite startup state counts, one-TTL lease-expiry grace, connection retries capped at 10 s through agent/shipper/CLI (including final delivery and source/artifact transfers), watch/log cursor resume; fencing unchanged.

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -325,5 +326,81 @@ func TestDockerArtifactsExtractWithoutDoubledSegment(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.ArtifactDir, "dist", "dist")); err == nil {
 		t.Fatal("doubled path segment dist/dist exists")
+	}
+}
+
+// TestDockerReapOrphans leaves a running container and its volume under
+// this runner's label, plus the same under another runner's name, and
+// expects Reap to remove only the first pair.
+func TestDockerReapOrphans(t *testing.T) {
+	e := newExec(t, Config{})
+	ctx := context.Background()
+	other := e.cfg.RunnerName + "-other"
+
+	orphan := func(runner, job string) {
+		t.Helper()
+		name := "quarry-" + job + "-1"
+		labels := map[string]string{LabelRunner: runner, LabelJob: job, LabelRun: "run1", LabelAttempt: "1"}
+		if _, err := e.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels}); err != nil {
+			t.Fatal(err)
+		}
+		hc, _ := hostConfig(name, pipeline.Resources{})
+		c, err := e.cli.ContainerCreate(ctx, &container.Config{
+			Image: testImage, Cmd: []string{"sleep", "300"}, Labels: labels,
+		}, hc, nil, nil, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.cli.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = e.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
+			_ = e.cli.VolumeRemove(ctx, name, true)
+		})
+	}
+	if err := e.ensureImage(ctx, testImage, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	orphan(e.cfg.RunnerName, "mine")
+	orphan(other, "theirs")
+
+	var out syncBuffer
+	if err := e.Reap(ctx, log.New(&out, "", 0)); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("reap log:\n%s", out.String())
+	assertClean(t, e)
+	mustContain(t, out.String(), "removed orphan container quarry-mine-1 (run run1)", "removed orphan volume quarry-mine-1 (run run1)")
+
+	f := filters.NewArgs(filters.Arg("label", LabelRunner+"="+other))
+	cs, err := e.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs, err := e.cli.VolumeList(ctx, volume.ListOptions{Filters: f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != 1 || len(vs.Volumes) != 1 {
+		t.Fatalf("other runner's remains touched: %d containers, %d volumes", len(cs), len(vs.Volumes))
+	}
+}
+
+// TestDockerReapKeepFailed: with KeepFailed the reaper leaves everything.
+func TestDockerReapKeepFailed(t *testing.T) {
+	e := newExec(t, Config{KeepFailed: true})
+	ctx := context.Background()
+	name := "quarry-" + e.cfg.RunnerName + "-keep"
+	labels := map[string]string{LabelRunner: e.cfg.RunnerName, LabelJob: name, LabelRun: "run1", LabelAttempt: "1"}
+	if _, err := e.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name, Labels: labels}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.cli.VolumeRemove(ctx, name, true) })
+	if err := e.Reap(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.cli.VolumeInspect(ctx, name); err != nil {
+		t.Fatalf("volume reaped despite KeepFailed: %v", err)
 	}
 }

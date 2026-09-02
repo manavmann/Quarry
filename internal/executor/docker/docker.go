@@ -33,7 +33,7 @@ import (
 )
 
 // Labels put on every container and volume so a runner can find (and,
-// from C16, reap) what it created. Values are the runner name and the
+// on startup, reap) what it created. Values are the runner name and the
 // attempt identity.
 const (
 	LabelRunner  = "quarry.runner"

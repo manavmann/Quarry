@@ -169,6 +169,13 @@ func run(logger *log.Logger) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// A previous process of this runner may have died mid-attempt; its
+	// containers and volumes carry our name and go before we claim.
+	if d, ok := exec.(*docker.Executor); ok {
+		if err := d.Reap(ctx, logger); err != nil {
+			return err
+		}
+	}
 	logger.Printf("%s %s polling %s (executor %s, capacity %d)",
 		version.String("runner"), cfg.agent.Name, cfg.agent.ServerURL, cfg.executor, cfg.agent.Capacity)
 	if err := a.Run(ctx); err != nil {
