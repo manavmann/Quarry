@@ -23,7 +23,7 @@ shipped in batches from the runner, and a cobra CLI drives it all.
 - `internal/agent` — runner poll loop, per-(job,attempt) goroutines, heartbeat
 - `internal/executor` — `Executor` interface; `docker/` (real) and `fake.go` impls
 - `internal/logship` — runner-side batching log shipper
-- `internal/artifact` — `ArtifactStore` interface; `local/` and `cairn/` backends
+- `internal/artifact` — `ArtifactStore` interface; `local/` and `remote/` backends
 - `internal/cli` — quarry CLI command implementations
 - `internal/harness` — in-process test harness (server + N fake agents)
 - `internal/metrics` — Prometheus registries

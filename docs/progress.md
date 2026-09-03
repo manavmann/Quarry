@@ -2,11 +2,46 @@
 
 Read this first each session. Newest entry on top.
 
+## C17 · artifact/local|remote: replicated-object-store backend and compose profile — done
+
+- Landed: `internal/artifact/local|remote` (`New(ctx, Config)` ensures the bucket, 409 = ok; `Put` spools to a temp file then streams it with `Content-Length`, retrying transport/5xx — `InsufficientReplicas` included — from the spool with capped backoff, 4xx never, ctx-aware; `Get` per-attempt header timeout, body at caller's pace; `Delete` = HEAD then DELETE because the coordinator's DELETE is idempotent; `List` follows `truncated`/`next_start_after`; every non-2xx decoded into `*Error{Status,Code,Message}`; optional bearer token). `cmd/server`: `QUARRY_ARTIFACT_BACKEND=local|remote`, `QUARRY_ARTIFACT_REMOTE_URL/BUCKET/TOKEN`, `openArtifacts` fails startup if the coordinator is unreachable. Compose `remote` profile: `storage-coordinator` + 3 nodes (RF=3, W=2, image `QUARRY_STORAGE_IMAGE`, coordinator on host `:8090`), server env driven by `QUARRY_ARTIFACT_BACKEND`. `docs/design-decisions.md` §7; CLAUDE.md package map `cairn/` → `remote/`.
+- Verified: untagged `local|remote` suite over an httptest fake coordinator (13 tests: local's cases ported, retries, store-down, 4xx not retried, cancel in backoff, pagination, token, escaping); docker-tagged `TestCluster{RoundTrip,PutFailureLeavesNothing,Replicated}` against the real cluster via `QUARRY_TEST_REMOTE_URL`; `go test -race ./...`, `make lint`, `go vet -tags docker` clean. End to end: full compose stack with `QUARRY_ARTIFACT_BACKEND=remote`, `examples/go-app` run succeeded with `storage-node-2` stopped → artifact on node1+node3 (`/cluster/locate`), CLI download sha256 verified, node back → repaired to 3 replicas in 2 s.
+- Flaky: nothing. Deviations: no GHCR image exists yet (the storage project has no publish workflow), so the compose default `ghcr.io/manavmann/distributed-object-storage:latest` is a placeholder — verified with a locally built `quarry-storage:dev` via `QUARRY_STORAGE_IMAGE`; server cannot `depends_on` a profiled service, so with the local|remote backend it relies on `New`'s retries + `restart: unless-stopped`; the harness store-failure test was not re-parametrised for remote — the equivalent lives in `remote.TestPutStoreDown`. Next: C18.
+
 ## C16 · executor/docker: orphan container and volume reaping on startup — done
 
-- Landed: `docker.(*Executor).Reap(ctx, logger)` lists by `quarry.runner=<name>` (containers `All`, then volumes), force-removes containers before volumes, logs each as `quarry-<job>-<attempt> (run <run>)` from the C07 labels plus a found-count line; a list failure is returned, a remove failure is logged and skipped; other runners' remains on the shared daemon are untouched. `cmd/runner` calls it after the signal ctx and before `agent.Run` when the executor is docker (fatal on error). `KeepFailed` skips the reap with a log line so `QUARRY_KEEP_FAILED=1` still keeps remains across a restart. Run/attach/cleanup untouched.
-- Verified: docker-tagged `TestDockerReapOrphans` (running container + volume under own label removed, foreign runner's pair intact, log lines asserted) and `TestDockerReapKeepFailed`; full `make test-docker` suite (24 s) and `go test -race ./...` clean, gofmt/vet clean.
-- Flaky: nothing. Next: C17 (not started). Deviation: reaper is a no-op under `KeepFailed` (entry says reap unconditionally).
+- Landed: `internal/executor/docker/reap.go` — `(*Executor).Reap(ctx,
+  logger)`: `ContainerList(All)` filtered by `quarry.runner=<name>`,
+  `ContainerRemove(Force)` each, then `VolumeList` by the same label and
+  `VolumeRemove(force)` each — containers before volumes so nothing is
+  still mounted; one log line per item as `quarry-<job>-<attempt> (run
+  <run>)` from the C07 `quarry.job/run/attempt` labels (containers also
+  show their state) plus a `N containers, M volumes found` line. A list
+  failure is returned; a remove failure is logged and the rest continues.
+  Only this runner's name is matched, so runners sharing one daemon
+  (compose) never touch each other's attempts. With `KeepFailed` the
+  reaper logs and does nothing, so `QUARRY_KEEP_FAILED=1` still keeps a
+  failed attempt's remains across a runner restart. `cmd/runner`: after
+  the signal ctx and before `agent.Run`, a docker executor is `Reap`ed;
+  an error is fatal (the daemon is unreachable, no job could run anyway).
+  `docker.go` only had its label comment updated; `Run`/attach/start/
+  cleanup untouched, no new dependency.
+- Verified: docker-tagged `TestDockerReapOrphans` (running `sleep 300`
+  container + named volume under this runner's label, same pair under a
+  foreign runner name → `Reap` → `assertClean` passes, both log lines
+  present, foreign pair still 1 container + 1 volume) and
+  `TestDockerReapKeepFailed` (labelled volume survives `Reap` with
+  `KeepFailed`); full `make test-docker` suite (~25 s) and `go test -race
+  ./...`, `go vet`, gofmt, `make lint` clean.
+- Flaky: nothing.
+- Next: C17.
+known gap: the reaper is skipped entirely under `KeepFailed` (the entry
+says reap unconditionally) — kept containers from earlier runs
+accumulate until removed by hand; reaping runs once at startup only, an
+attempt orphaned while the runner stays up (e.g. cleanup's 30 s remove
+timeout expiring) waits for the next restart; no Compose-level verify of
+a SIGKILLed runner this session (C12's manual clean-up scenario is
+covered by the tagged test, not end to end).
 
 ## C15 · server: restart recovery and reconnect — done
 

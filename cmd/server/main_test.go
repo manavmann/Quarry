@@ -8,11 +8,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"quarry/internal/artifact/remote"
 	"quarry/internal/store"
 )
 
@@ -105,5 +108,63 @@ func TestStartupStateCounts(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("missing %q in %q", want, out.String())
 		}
+	}
+}
+
+// The artifact backend is chosen by QUARRY_ARTIFACT_BACKEND: local by
+// default, remote only with a coordinator URL, anything else refused.
+func TestLoadConfigArtifactBackend(t *testing.T) {
+	t.Setenv("QUARRY_API_TOKEN", "tok")
+	t.Setenv("QUARRY_ARTIFACT_BACKEND", "")
+	t.Setenv("QUARRY_ARTIFACT_REMOTE_URL", "")
+	cfg, err := loadConfig()
+	if err != nil || cfg.backend != "local" || cfg.blobDir != "quarry-artifacts" {
+		t.Fatalf("default = %+v, %v", cfg, err)
+	}
+	t.Setenv("QUARRY_ARTIFACT_BACKEND", "remote")
+	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "QUARRY_ARTIFACT_REMOTE_URL") {
+		t.Fatalf("remote without a url: err = %v", err)
+	}
+	t.Setenv("QUARRY_ARTIFACT_REMOTE_URL", "http://storage:8080")
+	t.Setenv("QUARRY_ARTIFACT_REMOTE_TOKEN", "s3cret")
+	cfg, err = loadConfig()
+	if err != nil || cfg.backend != "remote" || cfg.remote.BaseURL != "http://storage:8080" ||
+		cfg.remote.Bucket != "quarry-artifacts" || cfg.remote.Token != "s3cret" {
+		t.Fatalf("remote = %+v, %v", cfg, err)
+	}
+	t.Setenv("QUARRY_ARTIFACT_BACKEND", "s3")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("unknown backend accepted")
+	}
+}
+
+// With the remote backend a coordinator that cannot be reached fails
+// startup; the bucket is ensured before the server listens.
+func TestOpenArtifactsRemote(t *testing.T) {
+	ctx := t.Context()
+	var created atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Path == "/v1/quarry-artifacts" {
+			created.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	cfg := config{backend: "remote", remote: remote.Config{BaseURL: srv.URL, Bucket: "quarry-artifacts"}}
+	blobs, desc, err := openArtifacts(ctx, cfg)
+	if err != nil || blobs == nil || created.Load() != 1 || desc != srv.URL+"/v1/quarry-artifacts" {
+		t.Fatalf("openArtifacts = %v, %q, %v (bucket puts %d)", blobs, desc, err, created.Load())
+	}
+	closed := httptest.NewServer(http.NotFoundHandler())
+	closed.Close()
+	cfg.remote = remote.Config{BaseURL: closed.URL, Attempts: 1}
+	if _, _, err := openArtifacts(ctx, cfg); err == nil {
+		t.Fatal("unreachable coordinator accepted at startup")
+	}
+	cfg = config{backend: "local", blobDir: filepath.Join(t.TempDir(), "blobs")}
+	if _, desc, err := openArtifacts(ctx, cfg); err != nil || !strings.HasSuffix(desc, "blobs") {
+		t.Fatalf("local openArtifacts = %q, %v", desc, err)
 	}
 }

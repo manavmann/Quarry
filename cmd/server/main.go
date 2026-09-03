@@ -10,7 +10,11 @@
 //	QUARRY_MAX_ATTEMPTS  claims per job before an infra/lost_runner
 //	                     failure is terminal         (default 3)
 //	QUARRY_LOG_CAP       max log bytes per attempt   (default 10485760)
-//	QUARRY_ARTIFACT_DIR  local artifact store root   (default quarry-artifacts)
+//	QUARRY_ARTIFACT_BACKEND        local or remote     (default local)
+//	QUARRY_ARTIFACT_DIR            local store root    (default quarry-artifacts)
+//	QUARRY_ARTIFACT_REMOTE_URL     remote coordinator  (required when remote)
+//	QUARRY_ARTIFACT_REMOTE_BUCKET  remote bucket       (default quarry-artifacts)
+//	QUARRY_ARTIFACT_REMOTE_TOKEN   remote bearer token (default none)
 package main
 
 import (
@@ -27,7 +31,9 @@ import (
 	"time"
 
 	"quarry/internal/api"
+	"quarry/internal/artifact"
 	"quarry/internal/artifact/local"
+	"quarry/internal/artifact/remote"
 	"quarry/internal/scheduler"
 	"quarry/internal/store"
 	"quarry/internal/version"
@@ -42,7 +48,9 @@ type config struct {
 	leaseTTL time.Duration
 	maxAtt   int
 	logCap   int64
+	backend  string // "local" or "remote"
 	blobDir  string
+	remote   remote.Config
 }
 
 func loadConfig() (config, error) {
@@ -53,10 +61,25 @@ func loadConfig() (config, error) {
 		leaseTTL: scheduler.DefaultLeaseTTL,
 		maxAtt:   scheduler.DefaultMaxAttempts,
 		logCap:   scheduler.DefaultLogCapBytes,
+		backend:  envOr("QUARRY_ARTIFACT_BACKEND", "local"),
 		blobDir:  envOr("QUARRY_ARTIFACT_DIR", "quarry-artifacts"),
+		remote: remote.Config{
+			BaseURL: os.Getenv("QUARRY_ARTIFACT_REMOTE_URL"),
+			Bucket:  envOr("QUARRY_ARTIFACT_REMOTE_BUCKET", "quarry-artifacts"),
+			Token:   os.Getenv("QUARRY_ARTIFACT_REMOTE_TOKEN"),
+		},
 	}
 	if c.apiToken == "" {
 		return c, errors.New("QUARRY_API_TOKEN must be set")
+	}
+	switch c.backend {
+	case "local":
+	case "remote":
+		if c.remote.BaseURL == "" {
+			return c, errors.New("QUARRY_ARTIFACT_REMOTE_URL must be set for QUARRY_ARTIFACT_BACKEND=remote")
+		}
+	default:
+		return c, fmt.Errorf("QUARRY_ARTIFACT_BACKEND: %q is not local or remote", c.backend)
 	}
 	if v := os.Getenv("QUARRY_LEASE_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -119,7 +142,7 @@ func run(logger *log.Logger) error {
 	if err := logStateCounts(ctx, st, logger); err != nil {
 		return err
 	}
-	blobs, err := local.New(cfg.blobDir)
+	blobs, blobsDesc, err := openArtifacts(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -142,8 +165,26 @@ func run(logger *log.Logger) error {
 		h.RunMonitor(ctx)
 	}()
 	defer func() { stop(); <-monDone }()
-	logger.Printf("%s listening on %s (db %s, artifacts %s, lease ttl %s, max attempts %d)", version.String("server"), cfg.listen, cfg.dbPath, blobs.Root(), cfg.leaseTTL, cfg.maxAtt)
+	logger.Printf("%s listening on %s (db %s, artifacts %s, lease ttl %s, max attempts %d)", version.String("server"), cfg.listen, cfg.dbPath, blobsDesc, cfg.leaseTTL, cfg.maxAtt)
 	return serve(ctx, srv, ln, logger)
+}
+
+// openArtifacts opens the configured artifact backend and names it for
+// the startup log line. The remote backend ensures its bucket here, so a
+// coordinator that is unreachable at startup is a startup failure.
+func openArtifacts(ctx context.Context, cfg config) (artifact.Store, string, error) {
+	if cfg.backend == "remote" {
+		s, err := remote.New(ctx, cfg.remote)
+		if err != nil {
+			return nil, "", err
+		}
+		return s, s.Describe(), nil
+	}
+	s, err := local.New(cfg.blobDir)
+	if err != nil {
+		return nil, "", err
+	}
+	return s, s.Root(), nil
 }
 
 func logStateCounts(ctx context.Context, st *store.Store, logger *log.Logger) error {

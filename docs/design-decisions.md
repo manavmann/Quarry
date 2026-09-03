@@ -123,3 +123,36 @@ semantics the user already knows, a visible `+ step` marker in the log,
 fail-fast via `set -e`, and an exit code that is the failing step's. The
 generated file is a pure function of the spec (`runScript`, unit-tested
 without Docker).
+
+## 7. Remote artifacts over the coordinator's HTTP API, with a spool, not a client library
+
+**Decision.** `internal/artifact/remote` is a hand-written `net/http`
+client for the replicated object store's coordinator (one bucket, one
+object per key, `PUT/GET/HEAD/DELETE /v1/{bucket}/{key}` and the paged
+listing), selected with `QUARRY_ARTIFACT_BACKEND=remote`. `Put` spools the
+reader to a temp file exactly as `local` does and then streams the file
+with an explicit `Content-Length`; transport errors and 5xx replies (the
+coordinator's `InsufficientReplicas`, `NoHealthyReplica`, `TooManyUploads`
+are all 503) are retried from the spool with capped exponential backoff,
+4xx never. `Delete` does a `HEAD` first because the coordinator's `DELETE`
+is idempotent and `artifact.Store` promises `ErrNotFound`. No auth is sent
+unless `QUARRY_ARTIFACT_REMOTE_TOKEN` is set (the cluster's shared secret
+only guards its node-to-coordinator heartbeat, not `/v1`). The compose
+`remote` profile runs the cluster at RF=3, W=2 next to the server.
+
+**Alternative.** Import the storage project's own Go client, or an S3 SDK
+with the coordinator behind an S3-compatible shim; or stream the request
+body straight through to the coordinator with no spool.
+
+**Why it lost.** A client import would be the first dependency that is
+not on the approved list and would tie Quarry's build to the other
+project's module path and rename-in-progress; the API surface Quarry
+needs is five routes and one error shape. Straight-through streaming
+cannot retry: the API handler hands `Put` a one-shot request body, so an
+`InsufficientReplicas` after the bytes are consumed would have to be
+turned into a runner-side re-upload, and a long or short reader would
+already be on the cluster before the mismatch was known. The spool costs
+one extra disk write per artifact — the same cost the local backend pays
+for its temp-and-rename — and buys retries, exact `Content-Length` for
+readers of unknown size (multipart source bundles), and `local`'s
+"nothing stored on failure" semantics unchanged.

@@ -6,6 +6,32 @@
 # Default profile has no external dependencies: SQLite and the local
 # artifact store live in the `quarry-data` named volume. Override the
 # token with QUARRY_API_TOKEN in the environment or a deploy/.env file.
+#
+# The `remote` profile adds a replicated object-store cluster (one
+# coordinator + three storage nodes, RF=3, W=2) and points the server's
+# artifact store at it. Both the profile and the backend switch are needed:
+#
+#   COMPOSE_PROFILES=remote QUARRY_ARTIFACT_BACKEND=remote \n#     docker compose -f deploy/docker-compose.yml up -d --build --wait
+#
+# The coordinator is published on  so
+# `QUARRY_TEST_REMOTE_URL=http://127.0.0.1:8090 make test-docker` runs the
+# integration tests against it. QUARRY_STORAGE_IMAGE overrides the image
+# (e.g. one built locally from the storage project's deploy/Dockerfile).
+
+x-storage-node: &storage-node
+  image: ${QUARRY_STORAGE_IMAGE:-ghcr.io/manavmann/distributed-object-storage:latest}
+  profiles: [remote]
+  command: ["/storagenode"]
+  restart: unless-stopped
+  depends_on:
+    storage-coordinator:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "/storagenode", "-healthcheck"]
+    interval: 2s
+    timeout: 5s
+    retries: 15
+    start_period: 5s
 
 x-runner: &runner
   build:
@@ -50,6 +76,13 @@ services:
     environment:
       QUARRY_API_TOKEN: ${QUARRY_API_TOKEN:-dev-token}
       QUARRY_LEASE_TTL: ${QUARRY_LEASE_TTL:-30s}
+      # local by default; remote needs the `remote` profile's cluster. The
+      # server cannot depends_on a profiled service, so with the remote
+      # backend it retries the bucket ensure and, failing that, is
+      # restarted until the coordinator is up.
+      QUARRY_ARTIFACT_BACKEND: ${QUARRY_ARTIFACT_BACKEND:-local}
+      QUARRY_ARTIFACT_REMOTE_URL: http://storage-coordinator:8080
+      QUARRY_ARTIFACT_REMOTE_BUCKET: ${QUARRY_ARTIFACT_REMOTE_BUCKET:-quarry-artifacts}
     volumes:
       - quarry-data:/var/lib/quarry
     healthcheck:
@@ -80,5 +113,71 @@ services:
       QUARRY_RUNNER_NAME: runner-3
       QUARRY_LABELS: os=linux,pool=test
 
+  # --- remote profile: replicated object store for artifacts ---
+
+  storage-coordinator:
+    image: ${QUARRY_STORAGE_IMAGE:-ghcr.io/manavmann/distributed-object-storage:latest}
+    profiles: [remote]
+    command: ["/coordinator"]
+    restart: unless-stopped
+    environment:
+      CAIRN_ADDR: ":8080"
+      CAIRN_DATA_DIR: /data
+      CAIRN_REPLICATION_FACTOR: "3"
+      CAIRN_WRITE_QUORUM: "2"
+      CAIRN_HEARTBEAT_TIMEOUT: 3s
+      CAIRN_REPAIR_INTERVAL: 2s
+      CAIRN_REPAIR_GRACE: 10s
+    ports:
+      - "${QUARRY_STORAGE_PORT:-8090}:8080"
+    volumes:
+      - storage-coordinator-data:/data
+    healthcheck:
+      test: ["CMD", "/coordinator", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  storage-node-1:
+    <<: *storage-node
+    environment:
+      CAIRN_NODE_ID: node1
+      CAIRN_ADDR: ":9000"
+      CAIRN_ADVERTISE_ADDR: http://storage-node-1:9000
+      CAIRN_COORDINATOR_URL: http://storage-coordinator:8080
+      CAIRN_HEARTBEAT_INTERVAL: 1s
+      CAIRN_DATA_DIR: /data
+    volumes:
+      - storage-node-1-data:/data
+
+  storage-node-2:
+    <<: *storage-node
+    environment:
+      CAIRN_NODE_ID: node2
+      CAIRN_ADDR: ":9000"
+      CAIRN_ADVERTISE_ADDR: http://storage-node-2:9000
+      CAIRN_COORDINATOR_URL: http://storage-coordinator:8080
+      CAIRN_HEARTBEAT_INTERVAL: 1s
+      CAIRN_DATA_DIR: /data
+    volumes:
+      - storage-node-2-data:/data
+
+  storage-node-3:
+    <<: *storage-node
+    environment:
+      CAIRN_NODE_ID: node3
+      CAIRN_ADDR: ":9000"
+      CAIRN_ADVERTISE_ADDR: http://storage-node-3:9000
+      CAIRN_COORDINATOR_URL: http://storage-coordinator:8080
+      CAIRN_HEARTBEAT_INTERVAL: 1s
+      CAIRN_DATA_DIR: /data
+    volumes:
+      - storage-node-3-data:/data
+
 volumes:
   quarry-data:
+  storage-coordinator-data:
+  storage-node-1-data:
+  storage-node-2-data:
+  storage-node-3-data:
