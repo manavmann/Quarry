@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -88,11 +89,13 @@ func (f *fakeCoordinator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(page)
 	case r.Method == http.MethodPut:
+		f.puts++
+		f.lengths = append(f.lengths, r.Header.Get("Content-Length"))
+		// After the bookkeeping: a hook that wakes the client (cancel) must
+		// not let the test observe the counter before it is written.
 		if f.onPut != nil {
 			f.onPut()
 		}
-		f.puts++
-		f.lengths = append(f.lengths, r.Header.Get("Content-Length"))
 		if r.ContentLength < 0 {
 			f.writeError(w, http.StatusLengthRequired, "LengthRequired", "Content-Length required")
 			return
@@ -129,6 +132,33 @@ func (f *fakeCoordinator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method", http.StatusMethodNotAllowed)
 	}
+}
+
+// The test goroutine reads fixture state only through these, under the
+// same lock the handler goroutine writes it with.
+func (f *fakeCoordinator) putCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.puts
+}
+
+func (f *fakeCoordinator) putLengths() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.lengths)
+}
+
+func (f *fakeCoordinator) authHeaders() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.auths)
+}
+
+func (f *fakeCoordinator) hasBucket(bucket string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.buckets[bucket]
+	return ok
 }
 
 func (f *fakeCoordinator) keys(bucket string) []string {
@@ -182,7 +212,7 @@ func readAll(t *testing.T, s *Store, key string) string {
 func TestNewEnsuresBucket(t *testing.T) {
 	f := newFake()
 	s := newStore(t, f, Config{Bucket: "b"})
-	if _, ok := f.buckets["b"]; !ok {
+	if !f.hasBucket("b") {
 		t.Fatal("bucket not created")
 	}
 	if _, err := New(t.Context(), Config{BaseURL: s.base, Bucket: "b"}); err != nil {
@@ -208,8 +238,8 @@ func TestPutGetDeleteList(t *testing.T) {
 	if got := readAll(t, s, key); got != string(body) {
 		t.Fatalf("Get = %q, want %q", got, body)
 	}
-	if f.lengths[0] != strconv.Itoa(len(body)) {
-		t.Fatalf("PUT Content-Length = %q, want %d", f.lengths[0], len(body))
+	if f.putLengths()[0] != strconv.Itoa(len(body)) {
+		t.Fatalf("PUT Content-Length = %q, want %d", f.putLengths()[0], len(body))
 	}
 	keys, err := s.List(ctx, artifact.JobPrefix("r1", "j1", 1))
 	if err != nil {
@@ -287,8 +317,8 @@ func TestPutFailureLeavesNothing(t *testing.T) {
 	if _, err := s.Get(ctx, key); !errors.Is(err, artifact.ErrNotFound) {
 		t.Fatalf("partial object visible: Get = %v", err)
 	}
-	if f.puts != 0 {
-		t.Fatalf("coordinator saw %d PUTs from a failed reader", f.puts)
+	if f.putCount() != 0 {
+		t.Fatalf("coordinator saw %d PUTs from a failed reader", f.putCount())
 	}
 	if err := s.Put(ctx, key, strings.NewReader("ok"), 2); err != nil {
 		t.Fatal(err)
@@ -315,8 +345,8 @@ func TestPutSizeMismatch(t *testing.T) {
 	if err := s.Put(ctx, "a/long", strings.NewReader("abcdef"), 5); err == nil {
 		t.Fatal("long reader accepted")
 	}
-	if f.puts != 0 || len(f.keys(defaultBucket)) != 0 {
-		t.Fatalf("PUTs = %d, objects = %v", f.puts, f.keys(defaultBucket))
+	if f.putCount() != 0 || len(f.keys(defaultBucket)) != 0 {
+		t.Fatalf("PUTs = %d, objects = %v", f.putCount(), f.keys(defaultBucket))
 	}
 }
 
@@ -332,8 +362,8 @@ func TestPutUnknownSize(t *testing.T) {
 	if got := readAll(t, s, "sources/r1.tar"); got != "streamed" {
 		t.Fatalf("Get = %q", got)
 	}
-	if f.lengths[0] != "8" {
-		t.Fatalf("Content-Length = %q, want 8", f.lengths[0])
+	if f.putLengths()[0] != "8" {
+		t.Fatalf("Content-Length = %q, want 8", f.putLengths()[0])
 	}
 }
 
@@ -343,7 +373,7 @@ func TestTraversalRejected(t *testing.T) {
 	ctx := t.Context()
 	f := newFake()
 	s := newStore(t, f, Config{})
-	before := len(f.auths)
+	before := len(f.authHeaders())
 	for _, key := range []string{"../escaped", "runs/../../escaped", "/escaped", "runs\\..\\escaped", "runs/./escaped", ""} {
 		if err := s.Put(ctx, key, strings.NewReader("x"), 1); err == nil {
 			t.Errorf("Put(%q) accepted", key)
@@ -358,8 +388,8 @@ func TestTraversalRejected(t *testing.T) {
 	if _, err := s.List(ctx, "../"); err == nil {
 		t.Error("List(\"../\") accepted")
 	}
-	if len(f.auths) != before {
-		t.Fatalf("%d requests reached the coordinator for invalid keys", len(f.auths)-before)
+	if len(f.authHeaders()) != before {
+		t.Fatalf("%d requests reached the coordinator for invalid keys", len(f.authHeaders())-before)
 	}
 }
 
@@ -371,7 +401,7 @@ func TestPutHonoursContext(t *testing.T) {
 	if err := s.Put(ctx, "a/b", strings.NewReader("abc"), 3); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Put = %v, want context.Canceled", err)
 	}
-	if f.puts != 0 {
+	if f.putCount() != 0 {
 		t.Fatal("cancelled Put reached the coordinator")
 	}
 }
@@ -385,8 +415,8 @@ func TestPutRetriesInsufficientReplicas(t *testing.T) {
 	if err := s.Put(t.Context(), "a/b", strings.NewReader("abc"), 3); err != nil {
 		t.Fatal(err)
 	}
-	if f.puts != 3 || f.lengths[0] != "3" || f.lengths[1] != "3" || f.lengths[2] != "3" {
-		t.Fatalf("PUTs = %d, lengths = %v", f.puts, f.lengths)
+	if f.putCount() != 3 || f.putLengths()[0] != "3" || f.putLengths()[1] != "3" || f.putLengths()[2] != "3" {
+		t.Fatalf("PUTs = %d, lengths = %v", f.putCount(), f.putLengths())
 	}
 	if got := readAll(t, s, "a/b"); got != "abc" {
 		t.Fatalf("Get = %q", got)
@@ -406,8 +436,8 @@ func TestPutStoreDown(t *testing.T) {
 	if !errors.As(err, &e) || e.Status != 503 || e.Code != "InsufficientReplicas" {
 		t.Fatalf("Put = %v, want 503 InsufficientReplicas", err)
 	}
-	if !strings.Contains(err.Error(), "after 3 attempts") || f.puts != 3 {
-		t.Fatalf("Put = %v after %d PUTs, want 3", err, f.puts)
+	if !strings.Contains(err.Error(), "after 3 attempts") || f.putCount() != 3 {
+		t.Fatalf("Put = %v after %d PUTs, want 3", err, f.putCount())
 	}
 	if _, err := s.Get(t.Context(), "a/b"); !errors.Is(err, artifact.ErrNotFound) {
 		t.Fatalf("Get = %v, want ErrNotFound", err)
@@ -433,7 +463,7 @@ func TestClientErrorNotRetried(t *testing.T) {
 	// A bucket the fake has never seen makes every object request a 404
 	// NoSuchBucket; Get and Delete map it to ErrNotFound like NoSuchKey.
 	s.cfg.Bucket = "missing"
-	before := len(f.auths)
+	before := len(f.authHeaders())
 	if _, err := s.Get(t.Context(), "a/b"); !errors.Is(err, artifact.ErrNotFound) {
 		t.Fatalf("Get = %v", err)
 	}
@@ -442,8 +472,8 @@ func TestClientErrorNotRetried(t *testing.T) {
 	if !errors.As(err, &e) || e.Status != 404 || e.Code != "NoSuchBucket" || !strings.Contains(err.Error(), "NoSuchBucket") {
 		t.Fatalf("Put = %v, want decoded 404 NoSuchBucket", err)
 	}
-	if len(f.auths)-before != 2 {
-		t.Fatalf("%d requests for two 4xx calls, want 2 (no retries)", len(f.auths)-before)
+	if len(f.authHeaders())-before != 2 {
+		t.Fatalf("%d requests for two 4xx calls, want 2 (no retries)", len(f.authHeaders())-before)
 	}
 }
 
@@ -459,8 +489,8 @@ func TestRetryHonoursContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Put = %v, want context.Canceled", err)
 	}
-	if f.puts != 1 {
-		t.Fatalf("PUTs = %d, want 1", f.puts)
+	if f.putCount() != 1 {
+		t.Fatalf("PUTs = %d, want 1", f.putCount())
 	}
 }
 
@@ -495,15 +525,15 @@ func TestBearerToken(t *testing.T) {
 	if err := s.Put(t.Context(), "a/b", strings.NewReader("x"), 1); err != nil {
 		t.Fatal(err)
 	}
-	for _, a := range f.auths {
+	for _, a := range f.authHeaders() {
 		if a != "Bearer s3cret" {
 			t.Fatalf("Authorization = %q", a)
 		}
 	}
 	plain := newFake()
 	newStore(t, plain, Config{})
-	if plain.auths[0] != "" {
-		t.Fatalf("Authorization sent without a token: %q", plain.auths[0])
+	if plain.authHeaders()[0] != "" {
+		t.Fatalf("Authorization sent without a token: %q", plain.authHeaders()[0])
 	}
 }
 
