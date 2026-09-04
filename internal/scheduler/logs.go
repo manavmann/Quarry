@@ -28,7 +28,9 @@ func (s *Scheduler) AppendLogs(ctx context.Context, jobID string, attempt int, c
 			return &InvalidResultError{Msg: fmt.Sprintf("log chunk seq %d must be >= 1", c.Seq)}
 		}
 	}
-	return s.st.Tx(ctx, func(tx *sql.Tx) error {
+	var stored int64
+	err := s.st.Tx(ctx, func(tx *sql.Tx) error {
+		stored = 0
 		job, err := s.st.GetJob(ctx, tx, jobID)
 		if err != nil {
 			return err
@@ -57,6 +59,7 @@ func (s *Scheduler) AppendLogs(ctx context.Context, jobID string, attempt int, c
 				continue // duplicate delivery; the first copy stands
 			}
 			total += int64(len(data))
+			stored += int64(len(data))
 			if len(data) < len(c.Data) {
 				lost = true
 			}
@@ -71,4 +74,8 @@ func (s *Scheduler) AppendLogs(ctx context.Context, jobID string, attempt int, c
 		return s.event(ctx, tx, job.RunID, jobID, EventLogsTruncated,
 			map[string]any{"attempt": attempt, "cap_bytes": s.logCap})
 	})
+	if err == nil {
+		s.m.LogBytes.Add(float64(stored))
+	}
+	return err
 }

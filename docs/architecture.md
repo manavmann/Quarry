@@ -95,7 +95,34 @@ the host daemon (Docker-out-of-Docker). A runner's healthcheck is "has
 it registered with the server", so `docker compose up --wait` returns
 only when the fleet can take work.
 
+## Observability
+
+Both binaries log one JSON line per event through `log/slog` with a
+`component` field (`server` or `runner`). A line carries the identifiers
+in scope where it is written: `request_id` on failed API requests,
+`runner_id` on every runner line after registration, and `run_id`,
+`job_id`, `attempt` on every line inside an attempt. The events table
+remains the domain-level trace; logs are for the process, not the run.
+
+The server serves Prometheus metrics at `GET /metrics` (no token, like
+`/healthz`), updated by the scheduler after each committed transaction:
+
+| series                           | kind      | meaning                                        |
+|----------------------------------|-----------|------------------------------------------------|
+| `quarry_jobs_total{state}`       | counter   | job transitions by the state entered           |
+| `quarry_queue_depth{labels}`     | gauge     | queued jobs by required labels, read at scrape |
+| `quarry_job_duration_seconds`    | histogram | claim → terminal result, per attempt           |
+| `quarry_claim_latency_seconds`   | histogram | queued → running                               |
+| `quarry_lease_expirations_total` | counter   | leases the monitor found expired               |
+| `quarry_runners{state}`          | gauge     | runners by state, read at scrape               |
+| `quarry_log_bytes_total`         | counter   | log bytes stored, after the per-attempt cap    |
+
+A runner exposes `quarry_runner_active_jobs` and
+`quarry_runner_executor_errors_total` on `QUARRY_METRICS_LISTEN` when set
+(compose sets `:9100`). The compose `prometheus` profile scrapes all four
+every 5 s from `deploy/prometheus.yml`; there is no Grafana and no tracing.
+
 ## Not yet
 
-`/metrics`, artifact retention, `web/`.
+Artifact retention, `web/`.
 Tracked in `docs/progress.md`.

@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +43,7 @@ func TestServerShutdownDrainsRequests(t *testing.T) {
 	}
 	defer srv.Close()
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, srv, ln, log.New(io.Discard, "", 0)) }()
+	go func() { done <- serve(ctx, srv, ln, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
 	reply := make(chan string, 1)
 	go func() {
 		resp, err := http.Get("http://" + ln.Addr().String())
@@ -101,13 +102,20 @@ func TestStartupStateCounts(t *testing.T) {
 	}
 	defer st.Close()
 	var out bytes.Buffer
-	if err := logStateCounts(ctx, st, log.New(&out, "", 0)); err != nil {
+	if err := logStateCounts(ctx, st, slog.New(slog.NewJSONHandler(&out, nil))); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"runs=map[pending:1]", "jobs=map[pending:1 queued:1]", "runners=map[]"} {
-		if !strings.Contains(out.String(), want) {
-			t.Fatalf("missing %q in %q", want, out.String())
-		}
+	var line struct {
+		Msg     string           `json:"msg"`
+		Runs    map[string]int64 `json:"runs"`
+		Jobs    map[string]int64 `json:"jobs"`
+		Runners map[string]int64 `json:"runners"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &line); err != nil {
+		t.Fatalf("not one JSON line: %q: %v", out.String(), err)
+	}
+	if line.Msg != "startup states" || line.Runs["pending"] != 1 || line.Jobs["pending"] != 1 || line.Jobs["queued"] != 1 || len(line.Runners) != 0 {
+		t.Fatalf("startup line = %q", out.String())
 	}
 }
 

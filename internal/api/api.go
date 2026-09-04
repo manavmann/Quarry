@@ -13,13 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"quarry/internal/artifact"
+	"quarry/internal/metrics"
 	"quarry/internal/pipeline"
 	"quarry/internal/scheduler"
 	"quarry/internal/store"
@@ -35,13 +36,16 @@ const MaxSourceBytes = 256 << 20
 type Config struct {
 	// APIToken is the bearer token every /api/* request must present.
 	APIToken string
-	// Logger receives one line per request; nil means log.Default().
-	Logger *log.Logger
+	// Logger receives one line per failed request and per monitor tick
+	// that changed something; nil means slog.Default().
+	Logger *slog.Logger
 	// Scheduler tunes the runner protocol (lease TTL, max attempts, monitor).
 	Scheduler scheduler.Config
 	// Artifacts holds source bundles and job artifacts. Required: the
 	// server is its only writer.
 	Artifacts artifact.Store
+	// Metrics is the set GET /metrics serves; nil means a private one.
+	Metrics *metrics.Server
 }
 
 // Server serves the user API over a *store.Store.
@@ -57,13 +61,20 @@ type Server struct {
 // panics without an artifact store: there is no meaningful fallback.
 func New(st *store.Store, cfg Config) *Server {
 	if cfg.Logger == nil {
-		cfg.Logger = log.Default()
+		cfg.Logger = slog.Default()
 	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.NewServer()
+	}
+	cfg.Scheduler.Metrics = cfg.Metrics
 	if cfg.Artifacts == nil {
 		panic("api: Config.Artifacts is required")
 	}
 	s := &Server{st: st, sched: scheduler.New(st, cfg.Scheduler), artifacts: cfg.Artifacts, cfg: cfg, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	// Unauthenticated like /healthz: the series carry no secrets and a
+	// scrape config should not need the API token.
+	s.mux.Handle("GET /metrics", cfg.Metrics.Handler())
 
 	api := http.NewServeMux()
 	api.HandleFunc("POST /api/runs", s.handleSubmitRun)
@@ -187,6 +198,13 @@ func (s *Server) handleSubmitRun(w http.ResponseWriter, r *http.Request) {
 		}
 		s.internalError(w, r, err)
 		return
+	}
+	// The roots entered queued here; every later transition is counted by
+	// the scheduler.
+	for i := range jobs {
+		if jobs[i].State == store.JobQueued {
+			s.cfg.Metrics.JobsTotal.WithLabelValues(store.JobQueued).Inc()
+		}
 	}
 	writeJSON(w, http.StatusCreated, runDetail(run, jobs))
 }
@@ -454,7 +472,7 @@ func (s *Server) storeError(w http.ResponseWriter, r *http.Request, err error, w
 }
 
 func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error) {
-	s.cfg.Logger.Printf("request %s: %s %s: %v", RequestID(r.Context()), r.Method, r.URL.Path, err)
+	s.cfg.Logger.Error("request failed", "request_id", RequestID(r.Context()), "method", r.Method, "path", r.URL.Path, "err", err)
 	writeError(w, r, http.StatusInternalServerError, "internal error")
 }
 

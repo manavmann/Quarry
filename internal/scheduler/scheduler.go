@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"time"
 
+	"quarry/internal/metrics"
 	"quarry/internal/pipeline"
 	"quarry/internal/store"
 )
@@ -79,11 +80,15 @@ type Config struct {
 	// TimeoutGrace is how far past its timeout a running job may be before
 	// the monitor asks its runner to cancel it.
 	TimeoutGrace time.Duration
+	// Metrics receives every state transition; nil means a private set
+	// nothing scrapes.
+	Metrics *metrics.Server
 }
 
 // Scheduler applies the runner protocol over a store.
 type Scheduler struct {
 	st          *store.Store
+	m           *metrics.Server
 	ttl         int64 // milliseconds
 	logCap      int64
 	maxAttempts int
@@ -114,12 +119,17 @@ func New(st *store.Store, cfg Config) *Scheduler {
 	if cfg.TimeoutGrace <= 0 {
 		cfg.TimeoutGrace = DefaultTimeoutGrace
 	}
-	return &Scheduler{
-		st: st, ttl: cfg.LeaseTTL.Milliseconds(), logCap: cfg.LogCapBytes, maxAttempts: cfg.MaxAttempts,
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.NewServer()
+	}
+	s := &Scheduler{
+		st: st, m: cfg.Metrics, ttl: cfg.LeaseTTL.Milliseconds(), logCap: cfg.LogCapBytes, maxAttempts: cfg.MaxAttempts,
 		monitorEach: cfg.MonitorInterval, offlineMS: cfg.RunnerOfflineAfter.Milliseconds(),
 		graceMS:         cfg.TimeoutGrace.Milliseconds(),
 		leaseGraceUntil: st.Now() + cfg.LeaseTTL.Milliseconds(),
 	}
+	s.m.SetSnapshot(s.Snapshot)
+	return s
 }
 
 // LeaseTTL is the configured lease duration.
@@ -127,6 +137,70 @@ func (s *Scheduler) LeaseTTL() time.Duration { return time.Duration(s.ttl) * tim
 
 // MaxAttempts is the attempt cap new jobs are created with.
 func (s *Scheduler) MaxAttempts() int { return s.maxAttempts }
+
+// Metrics is the metric set this scheduler updates.
+func (s *Scheduler) Metrics() *metrics.Server { return s.m }
+
+// Snapshot reads the queue (queued jobs grouped by required labels) and
+// the runner states outside any transaction; it backs the scrape-time
+// gauges.
+func (s *Scheduler) Snapshot(ctx context.Context) (metrics.Snapshot, error) {
+	snap := metrics.Snapshot{QueueDepth: map[string]int{}, Runners: map[string]int{}}
+	queued, err := s.st.ListQueuedJobs(ctx, s.st.Reader())
+	if err != nil {
+		return snap, err
+	}
+	for i := range queued {
+		need, err := specLabels(&queued[i])
+		if err != nil {
+			return snap, err
+		}
+		snap.QueueDepth[metrics.LabelKey(need)]++
+	}
+	runners, err := s.st.ListRunners(ctx, s.st.Reader())
+	if err != nil {
+		return snap, err
+	}
+	for i := range runners {
+		snap.Runners[runners[i].State]++
+	}
+	return snap, nil
+}
+
+// transitions accumulates what one transaction changed and is applied to
+// the metrics only after it committed, so a rolled-back transaction is
+// never counted: the store row is the truth, the counter is a trace.
+type transitions struct {
+	entered    map[string]int
+	durationMS []int64 // started→finished of each terminal attempt
+}
+
+func (t *transitions) enter(state string) {
+	if t.entered == nil {
+		t.entered = map[string]int{}
+	}
+	t.entered[state]++
+}
+
+// finished records a terminal attempt: the state and its duration.
+func (t *transitions) finished(state string, startedAt, finishedAt int64) {
+	t.enter(state)
+	if startedAt > 0 && finishedAt >= startedAt {
+		t.durationMS = append(t.durationMS, finishedAt-startedAt)
+	}
+}
+
+func (t *transitions) apply(m *metrics.Server) {
+	for state, n := range t.entered {
+		m.JobsTotal.WithLabelValues(state).Add(float64(n))
+	}
+	for _, ms := range t.durationMS {
+		m.JobDuration.Observe(seconds(ms))
+	}
+}
+
+// seconds converts a store duration in Unix milliseconds.
+func seconds(ms int64) float64 { return float64(ms) / 1000 }
 
 // retryable reports whether a failure of this kind may be retried below
 // max_attempts. This is the only place retry eligibility is decided:
@@ -203,6 +277,10 @@ func (s *Scheduler) Claim(ctx context.Context, r RunnerInfo) (*store.Job, error)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if claimed != nil {
+		s.m.JobsTotal.WithLabelValues(store.JobRunning).Inc()
+		s.m.ClaimLatency.Observe(seconds(claimed.StartedAt - claimed.QueuedAt))
 	}
 	return claimed, nil
 }
@@ -287,7 +365,9 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 		return nil, &InvalidResultError{Msg: fmt.Sprintf("invalid status %q", res.Status)}
 	}
 	var out *store.Job
+	var tr transitions
 	err := s.st.Tx(ctx, func(tx *sql.Tx) error {
+		tr = transitions{}
 		job, err := s.st.GetJob(ctx, tx, jobID)
 		if err != nil {
 			return err
@@ -305,6 +385,7 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 			if _, err := s.st.FinishJob(ctx, tx, jobID, attempt, store.JobSucceeded, "", res.ExitCode, ""); err != nil {
 				return err
 			}
+			tr.finished(store.JobSucceeded, job.StartedAt, s.st.Now())
 			if err := s.event(ctx, tx, job.RunID, jobID, "job.succeeded", map[string]any{"attempt": attempt}); err != nil {
 				return err
 			}
@@ -319,6 +400,7 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 			if _, err := s.st.FinishJob(ctx, tx, jobID, attempt, state, kind, res.ExitCode, msg); err != nil {
 				return err
 			}
+			tr.finished(state, job.StartedAt, s.st.Now())
 			if err := s.event(ctx, tx, job.RunID, jobID, typ,
 				map[string]any{"attempt": attempt, "failure_kind": kind, "error": msg}); err != nil {
 				return err
@@ -328,6 +410,7 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 			if _, err := s.st.RequeueJob(ctx, tx, jobID, attempt, res.Error); err != nil {
 				return err
 			}
+			tr.enter(store.JobQueued)
 			if err := s.event(ctx, tx, job.RunID, jobID, "job.requeued",
 				map[string]any{"attempt": attempt, "failure_kind": res.FailureKind, "error": res.Error}); err != nil {
 				return err
@@ -336,13 +419,14 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 			if _, err := s.st.FinishJob(ctx, tx, jobID, attempt, store.JobFailed, res.FailureKind, res.ExitCode, res.Error); err != nil {
 				return err
 			}
+			tr.finished(store.JobFailed, job.StartedAt, s.st.Now())
 			if err := s.event(ctx, tx, job.RunID, jobID, "job.failed",
 				map[string]any{"attempt": attempt, "failure_kind": res.FailureKind, "exit_code": res.ExitCode, "error": res.Error}); err != nil {
 				return err
 			}
 		}
 
-		if err := s.advance(ctx, tx, job.RunID); err != nil {
+		if err := s.advance(ctx, tx, job.RunID, &tr); err != nil {
 			return err
 		}
 		out, err = s.st.GetJob(ctx, tx, jobID)
@@ -351,6 +435,7 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 	if err != nil {
 		return nil, err
 	}
+	tr.apply(s.m)
 	return out, nil
 }
 
@@ -365,7 +450,9 @@ func (s *Scheduler) Complete(ctx context.Context, jobID string, attempt int, res
 // down is a no-op.
 func (s *Scheduler) CancelRun(ctx context.Context, runID string) (*store.Run, error) {
 	var out *store.Run
+	var tr transitions
 	err := s.st.Tx(ctx, func(tx *sql.Tx) error {
+		tr = transitions{}
 		run, err := s.st.GetRun(ctx, tx, runID)
 		if err != nil {
 			return err
@@ -396,6 +483,7 @@ func (s *Scheduler) CancelRun(ctx context.Context, runID string) (*store.Run, er
 				} else if !ok {
 					continue
 				}
+				tr.enter(store.JobCancelled)
 				if err := s.event(ctx, tx, runID, job.ID, "job.cancelled",
 					map[string]any{"attempt": job.Attempt, "failure_kind": store.FailureCancelled}); err != nil {
 					return err
@@ -415,7 +503,7 @@ func (s *Scheduler) CancelRun(ctx context.Context, runID string) (*store.Run, er
 		if err := s.event(ctx, tx, runID, "", "run.cancel_requested", nil); err != nil {
 			return err
 		}
-		if err := s.advance(ctx, tx, runID); err != nil {
+		if err := s.advance(ctx, tx, runID, &tr); err != nil {
 			return err
 		}
 		out, err = s.st.GetRun(ctx, tx, runID)
@@ -424,6 +512,7 @@ func (s *Scheduler) CancelRun(ctx context.Context, runID string) (*store.Run, er
 	if err != nil {
 		return nil, err
 	}
+	tr.apply(s.m)
 	return out, nil
 }
 
@@ -431,7 +520,7 @@ func (s *Scheduler) CancelRun(ctx context.Context, runID string) (*store.Run, er
 // pending job with a failed/cancelled/skipped need (transitively, by
 // iterating to a fixpoint), then finalizes the run if no job can still
 // change state. It runs inside the completion transaction.
-func (s *Scheduler) advance(ctx context.Context, tx *sql.Tx, runID string) error {
+func (s *Scheduler) advance(ctx context.Context, tx *sql.Tx, runID string, tr *transitions) error {
 	jobs, err := s.st.ListJobs(ctx, tx, runID)
 	if err != nil {
 		return err
@@ -484,6 +573,7 @@ func (s *Scheduler) advance(ctx context.Context, tx *sql.Tx, runID string) error
 			}
 			state[j.ID] = next
 			changed = true
+			tr.enter(next)
 			typ := "job.queued"
 			if next == store.JobSkipped {
 				typ = "job.skipped"

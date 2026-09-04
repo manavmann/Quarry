@@ -1,0 +1,13 @@
+# Scrape config for the compose `prometheus` profile. The server exposes
+# /metrics on its API port without a token; each runner serves its own
+# set on QUARRY_METRICS_LISTEN (:9100 in compose).
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: quarry-server
+    static_configs:
+      - targets: ["server:8080"]
+  - job_name: quarry-runner
+    static_configs:
+      - targets: ["runner-1:9100", "runner-2:9100", "runner-3:9100"]

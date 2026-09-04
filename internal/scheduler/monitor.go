@@ -3,7 +3,7 @@ package scheduler
 import (
 	"context"
 	"database/sql"
-	"log"
+	"log/slog"
 	"time"
 
 	"quarry/internal/store"
@@ -27,8 +27,10 @@ type TickReport struct {
 // changes is selected by the next one.
 func (s *Scheduler) Tick(ctx context.Context) (TickReport, error) {
 	var rep TickReport
+	var tr transitions
+	var expiredN int
 	err := s.st.Tx(ctx, func(tx *sql.Tx) error {
-		rep = TickReport{}
+		rep, tr, expiredN = TickReport{}, transitions{}, 0
 		now := s.st.Now()
 		// Even leases already expired during downtime get one full TTL for
 		// live runners to renew. Timeout and offline checks still run.
@@ -42,6 +44,7 @@ func (s *Scheduler) Tick(ctx context.Context) (TickReport, error) {
 		}
 		for i := range expired {
 			job := &expired[i]
+			expiredN++
 			detail := map[string]any{"attempt": job.Attempt, "failure_kind": store.FailureLostRunner,
 				"runner_id": job.RunnerID, "lease_expires_at": job.LeaseExpiresAt}
 			msg := "lease expired"
@@ -52,6 +55,7 @@ func (s *Scheduler) Tick(ctx context.Context) (TickReport, error) {
 				if _, err := s.st.RequeueJob(ctx, tx, job.ID, job.Attempt, msg); err != nil {
 					return err
 				}
+				tr.enter(store.JobQueued)
 				if err := s.event(ctx, tx, job.RunID, job.ID, "job.requeued", detail); err != nil {
 					return err
 				}
@@ -61,10 +65,11 @@ func (s *Scheduler) Tick(ctx context.Context) (TickReport, error) {
 			if _, err := s.st.FinishJob(ctx, tx, job.ID, job.Attempt, store.JobFailed, store.FailureLostRunner, nil, msg); err != nil {
 				return err
 			}
+			tr.finished(store.JobFailed, job.StartedAt, now)
 			if err := s.event(ctx, tx, job.RunID, job.ID, "job.failed", detail); err != nil {
 				return err
 			}
-			if err := s.advance(ctx, tx, job.RunID); err != nil {
+			if err := s.advance(ctx, tx, job.RunID, &tr); err != nil {
 				return err
 			}
 			rep.Failed = append(rep.Failed, job.ID)
@@ -97,6 +102,10 @@ func (s *Scheduler) Tick(ctx context.Context) (TickReport, error) {
 		rep.RunnersOffline, err = s.st.MarkRunnersOffline(ctx, tx, now-s.offlineMS)
 		return err
 	})
+	if err == nil {
+		tr.apply(s.m)
+		s.m.LeaseExpirations.Add(float64(expiredN))
+	}
 	return rep, err
 }
 
@@ -104,9 +113,9 @@ func (s *Scheduler) Tick(ctx context.Context) (TickReport, error) {
 // owns the goroutine it runs on; the ticker only paces the loop, every
 // timestamp comes from the store's clock. A failed tick is logged and the
 // next one retries it: nothing is lost, only delayed.
-func (s *Scheduler) RunMonitor(ctx context.Context, logger *log.Logger) {
+func (s *Scheduler) RunMonitor(ctx context.Context, logger *slog.Logger) {
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.Default()
 	}
 	t := time.NewTicker(s.monitorEach)
 	defer t.Stop()
@@ -119,12 +128,12 @@ func (s *Scheduler) RunMonitor(ctx context.Context, logger *log.Logger) {
 		rep, err := s.Tick(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
-				logger.Printf("lease monitor: %v", err)
+				logger.Error("lease monitor tick failed", "err", err)
 			}
 			continue
 		}
 		if len(rep.Requeued)+len(rep.Failed)+len(rep.TimedOut)+len(rep.RunnersOffline) > 0 {
-			logger.Printf("lease monitor: requeued %v, failed %v, timed out %v, runners offline %v", rep.Requeued, rep.Failed, rep.TimedOut, rep.RunnersOffline)
+			logger.Info("lease monitor", "requeued", rep.Requeued, "failed", rep.Failed, "timed_out", rep.TimedOut, "runners_offline", rep.RunnersOffline)
 		}
 	}
 }

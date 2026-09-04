@@ -21,7 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -117,16 +117,19 @@ func main() {
 		fmt.Println(version.String("server"))
 		return
 	}
-	logger := log.New(os.Stderr, "server: ", log.LstdFlags|log.Lmsgprefix)
+	// One JSON line per event; every line names the binary. Handlers add
+	// request_id, run_id, job_id, attempt and runner_id where they apply.
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("component", "server")
 	if err := run(logger); err != nil {
-		logger.Fatal(err)
+		logger.Error("fatal", "err", err)
+		os.Exit(1)
 	}
 }
 
 // run owns every goroutine the server starts: the listener and the lease
 // monitor below and the signal watcher inside signal.NotifyContext. All
 // end before run returns.
-func run(logger *log.Logger) error {
+func run(logger *slog.Logger) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -165,7 +168,7 @@ func run(logger *log.Logger) error {
 		h.RunMonitor(ctx)
 	}()
 	defer func() { stop(); <-monDone }()
-	logger.Printf("%s listening on %s (db %s, artifacts %s, lease ttl %s, max attempts %d)", version.String("server"), cfg.listen, cfg.dbPath, blobsDesc, cfg.leaseTTL, cfg.maxAtt)
+	logger.Info("listening", "version", version.Version, "addr", cfg.listen, "db", cfg.dbPath, "artifacts", blobsDesc, "lease_ttl", cfg.leaseTTL.String(), "max_attempts", cfg.maxAtt)
 	return serve(ctx, srv, ln, logger)
 }
 
@@ -187,18 +190,18 @@ func openArtifacts(ctx context.Context, cfg config) (artifact.Store, string, err
 	return s, s.Root(), nil
 }
 
-func logStateCounts(ctx context.Context, st *store.Store, logger *log.Logger) error {
+func logStateCounts(ctx context.Context, st *store.Store, logger *slog.Logger) error {
 	counts, err := st.StateCounts(ctx)
 	if err != nil {
 		return fmt.Errorf("startup state counts: %w", err)
 	}
-	logger.Printf("startup states: runs=%v jobs=%v runners=%v", counts["runs"], counts["jobs"], counts["runners"])
+	logger.Info("startup states", "runs", counts["runs"], "jobs", counts["jobs"], "runners", counts["runners"])
 	return nil
 }
 
 // serve owns the serving goroutine and drains requests before the caller
 // closes SQLite. Request contexts are independent of the signal context.
-func serve(ctx context.Context, srv *http.Server, ln net.Listener, logger *log.Logger) error {
+func serve(ctx context.Context, srv *http.Server, ln net.Listener, logger *slog.Logger) error {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	select {
@@ -206,7 +209,7 @@ func serve(ctx context.Context, srv *http.Server, ln net.Listener, logger *log.L
 		return err
 	case <-ctx.Done():
 	}
-	logger.Print("shutting down")
+	logger.Info("shutting down")
 	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(sctx); err != nil {

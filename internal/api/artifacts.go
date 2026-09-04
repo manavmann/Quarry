@@ -132,7 +132,7 @@ var errFenced = errors.New("api: attempt is not the running attempt")
 // leftover object without a row is unreachable through the API.
 func (s *Server) discard(key string) {
 	if err := s.artifacts.Delete(context.WithoutCancel(context.Background()), key); err != nil && !errors.Is(err, artifact.ErrNotFound) {
-		s.cfg.Logger.Printf("artifact discard %s: %v", key, err)
+		s.cfg.Logger.Warn("artifact discard failed", "key", key, "err", err)
 	}
 }
 

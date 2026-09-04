@@ -15,13 +15,16 @@
 //	QUARRY_HEARTBEAT_INTERVAL  lease refresh interval      (default 5s)
 //	QUARRY_EXECUTOR            fake | docker              (default fake)
 //	QUARRY_KEEP_FAILED         1 keeps failed containers   (default unset; docker only)
+//	QUARRY_METRICS_LISTEN      address serving /metrics    (default unset: no listener)
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -32,6 +35,7 @@ import (
 	"quarry/internal/agent"
 	"quarry/internal/executor"
 	"quarry/internal/executor/docker"
+	"quarry/internal/metrics"
 	"quarry/internal/version"
 )
 
@@ -39,6 +43,7 @@ type config struct {
 	agent      agent.Config
 	executor   string
 	keepFailed bool
+	metrics    string // listen address for /metrics; "" disables it
 }
 
 func loadConfig() (config, error) {
@@ -52,6 +57,7 @@ func loadConfig() (config, error) {
 	}
 	c.executor = envOr("QUARRY_EXECUTOR", "fake")
 	c.keepFailed = os.Getenv("QUARRY_KEEP_FAILED") == "1"
+	c.metrics = os.Getenv("QUARRY_METRICS_LISTEN")
 	if c.agent.ServerURL == "" || c.agent.Token == "" {
 		return c, errors.New("QUARRY_SERVER and QUARRY_API_TOKEN must be set")
 	}
@@ -144,16 +150,19 @@ func main() {
 		fmt.Println(version.String("runner"))
 		return
 	}
-	logger := log.New(os.Stderr, "runner: ", log.LstdFlags|log.Lmsgprefix)
+	// One JSON line per event; every line names the binary. The agent adds
+	// runner_id once registered and run_id/job_id/attempt inside an attempt.
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("component", "runner")
 	if err := run(logger); err != nil {
-		logger.Fatal(err)
+		logger.Error("fatal", "err", err)
+		os.Exit(1)
 	}
 }
 
 // run owns the agent's goroutines through agent.Run, which returns only
-// after they have all ended; the signal watcher lives inside
-// signal.NotifyContext.
-func run(logger *log.Logger) error {
+// after they have all ended, the optional metrics listener below, and the
+// signal watcher inside signal.NotifyContext.
+func run(logger *slog.Logger) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -163,6 +172,7 @@ func run(logger *log.Logger) error {
 		return err
 	}
 	cfg.agent.Logger = logger
+	cfg.agent.Metrics = metrics.NewRunner()
 	a, err := agent.New(cfg.agent, exec)
 	if err != nil {
 		return err
@@ -172,15 +182,45 @@ func run(logger *log.Logger) error {
 	// A previous process of this runner may have died mid-attempt; its
 	// containers and volumes carry our name and go before we claim.
 	if d, ok := exec.(*docker.Executor); ok {
-		if err := d.Reap(ctx, logger); err != nil {
+		// Reap writes plain lines; route them through the same JSON handler.
+		if err := d.Reap(ctx, slog.NewLogLogger(logger.Handler(), slog.LevelInfo)); err != nil {
 			return err
 		}
 	}
-	logger.Printf("%s %s polling %s (executor %s, capacity %d)",
-		version.String("runner"), cfg.agent.Name, cfg.agent.ServerURL, cfg.executor, cfg.agent.Capacity)
+	if cfg.metrics != "" {
+		_, stopMetrics, err := serveMetrics(cfg.metrics, cfg.agent.Metrics, logger)
+		if err != nil {
+			return err
+		}
+		defer stopMetrics()
+	}
+	logger.Info("polling", "version", version.Version, "name", cfg.agent.Name, "server", cfg.agent.ServerURL, "executor", cfg.executor, "capacity", cfg.agent.Capacity)
 	if err := a.Run(ctx); err != nil {
 		return err
 	}
-	logger.Print("stopped")
+	logger.Info("stopped")
 	return nil
+}
+
+// serveMetrics exposes m at addr/metrics and returns the bound address.
+// The listener is bound before returning so a bad address is a startup
+// error; the serving goroutine is owned by the caller through the returned
+// stop, which closes it.
+func serveMetrics(addr string, m *metrics.Runner, logger *slog.Logger) (bound string, stop func(), err error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return "", nil, fmt.Errorf("QUARRY_METRICS_LISTEN: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m.Handler())
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics listener failed", "err", err)
+		}
+	}()
+	logger.Info("metrics listening", "addr", ln.Addr().String())
+	return ln.Addr().String(), func() { _ = srv.Close(); <-done }, nil
 }

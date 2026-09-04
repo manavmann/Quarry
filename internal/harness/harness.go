@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -72,7 +72,7 @@ type Opts struct {
 type Harness struct {
 	t      *testing.T
 	opts   Opts
-	log    *log.Logger
+	log    *slog.Logger
 	st     *store.Store
 	dbPath string
 	url    string // immutable across restarts, safe for concurrent clients
@@ -136,7 +136,7 @@ func New(t *testing.T, opts Opts) *Harness {
 		opts.MonitorInterval = 10 * time.Millisecond
 	}
 	h := &Harness{
-		t: t, opts: opts, log: log.New(io.Discard, "", 0),
+		t: t, opts: opts, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		clock: &Clock{}, http: &http.Client{Timeout: 10 * time.Second},
 	}
 	h.clock.ms.Store(1_700_000_000_000)

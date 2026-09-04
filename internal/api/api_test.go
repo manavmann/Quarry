@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
-	"log"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -59,7 +59,7 @@ func newTestServerWithBlobs(t *testing.T) (*httptest.Server, *store.Store, *loca
 	if err != nil {
 		t.Fatalf("local.New: %v", err)
 	}
-	srv := httptest.NewServer(New(st, Config{APIToken: testToken, Logger: log.New(io.Discard, "", 0), Artifacts: blobs}))
+	srv := httptest.NewServer(New(st, Config{APIToken: testToken, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Artifacts: blobs}))
 	t.Cleanup(srv.Close)
 	return srv, st, blobs
 }

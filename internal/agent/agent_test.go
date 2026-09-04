@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -152,7 +152,7 @@ func TestAgentShutdownDuringOutage(t *testing.T) {
 				return reconnectReply("{}"), nil
 			}
 		})}
-		a, err := New(Config{ServerURL: "http://server", Name: "r", HTTPClient: hc, LogFlushTimeout: time.Second, Logger: log.New(io.Discard, "", 0)}, executor.NewFake())
+		a, err := New(Config{ServerURL: "http://server", Name: "r", HTTPClient: hc, LogFlushTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, executor.NewFake())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -241,7 +241,7 @@ func TestAgentDeliverySurvivesConnectionLoss(t *testing.T) {
 				})}
 				f := executor.NewFake()
 				f.Script("build", executor.Outcome{LogBytes: 10, Artifacts: map[string]string{"out": "artifact"}})
-				a, err := New(Config{ServerURL: "http://server", Name: "r", HTTPClient: hc, CompleteRetries: 1, LogFlushTimeout: time.Second, Logger: log.New(io.Discard, "", 0)}, f)
+				a, err := New(Config{ServerURL: "http://server", Name: "r", HTTPClient: hc, CompleteRetries: 1, LogFlushTimeout: time.Second, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, f)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -393,7 +393,7 @@ func testConfig(s *stubServer, capacity int) Config {
 	return Config{
 		ServerURL: s.srv.URL, Token: "tok", Name: "r1", Labels: map[string]string{"os": "test"},
 		Capacity: capacity, PollInterval: 5 * time.Millisecond, HeartbeatInterval: 5 * time.Millisecond,
-		CompleteBackoff: time.Millisecond, Logger: log.New(io.Discard, "", 0),
+		CompleteBackoff: time.Millisecond, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
 
@@ -404,11 +404,17 @@ func startAgent(t *testing.T, s *stubServer, exec executor.Executor, capacity in
 	if err != nil {
 		t.Fatal(err)
 	}
+	runAgent(t, a)
+	return a
+}
+
+// runAgent runs a until the test ends.
+func runAgent(t *testing.T, a *Agent) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); _ = a.Run(ctx) }()
 	t.Cleanup(func() { cancel(); <-done })
-	return a
 }
 
 // waitFor polls cond until it holds or the deadline passes.

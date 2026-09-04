@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -25,6 +25,7 @@ import (
 
 	"quarry/internal/executor"
 	"quarry/internal/logship"
+	"quarry/internal/metrics"
 )
 
 // Defaults for Config's zero values.
@@ -75,8 +76,12 @@ type Config struct {
 	LogFlushBytes    int
 	LogFlushTimeout  time.Duration
 
-	// Logger receives one line per notable event; nil means log.Default().
-	Logger *log.Logger
+	// Logger receives one line per notable event; nil means slog.Default().
+	// Lines carry runner_id once registered and run_id/job_id/attempt
+	// inside an attempt.
+	Logger *slog.Logger
+	// Metrics is the set this runner updates; nil means a private one.
+	Metrics *metrics.Runner
 	// HTTPClient defaults to a client with a 30s timeout.
 	HTTPClient *http.Client
 }
@@ -89,7 +94,8 @@ type Agent struct {
 	sem    chan struct{} // one token per busy capacity slot
 
 	mu       sync.Mutex
-	runnerID string // assigned by register; "" until then
+	runnerID string       // assigned by register; "" until then
+	log      *slog.Logger // cfg.Logger, plus runner_id once registered
 	active   map[attemptKey]context.CancelCauseFunc
 	jobs     sync.WaitGroup
 }
@@ -136,13 +142,17 @@ func New(cfg Config, exec executor.Executor) (*Agent, error) {
 		cfg.LogFlushTimeout = DefaultLogFlushTimeout
 	}
 	if cfg.Logger == nil {
-		cfg.Logger = log.Default()
+		cfg.Logger = slog.Default()
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = metrics.NewRunner()
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &Agent{
 		cfg:    cfg,
+		log:    cfg.Logger,
 		exec:   exec,
 		client: &client{base: cfg.ServerURL, token: cfg.Token, http: cfg.HTTPClient, backoff: cfg.CompleteBackoff},
 		sem:    make(chan struct{}, cfg.Capacity),
@@ -156,6 +166,13 @@ func (a *Agent) RunnerID() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.runnerID
+}
+
+// logger is the agent-wide logger, carrying runner_id once registered.
+func (a *Agent) logger() *slog.Logger {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.log
 }
 
 // Run registers, then polls for work until ctx is cancelled, then kills
@@ -214,8 +231,9 @@ func (a *Agent) register(ctx context.Context) error {
 		if err == nil {
 			a.mu.Lock()
 			a.runnerID = id
+			a.log = a.log.With("runner_id", id)
 			a.mu.Unlock()
-			a.cfg.Logger.Printf("registered as %s (runner_id %s)", a.cfg.Name, id)
+			a.logger().Info("registered", "name", a.cfg.Name)
 			return nil
 		}
 		var se *statusError
@@ -225,7 +243,7 @@ func (a *Agent) register(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		a.cfg.Logger.Printf("register: %v (retrying in %s)", err, backoff)
+		a.logger().Warn("register failed, retrying", "err", err, "retry_in", backoff.String())
 		if !a.wait(ctx, backoff) {
 			return ctx.Err()
 		}
@@ -256,7 +274,7 @@ func (a *Agent) pollLoop(ctx, deliveryCtx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			a.cfg.Logger.Printf("claim: %v", err)
+			a.logger().Warn("claim failed", "err", err)
 		case job != nil:
 			a.start(ctx, deliveryCtx, job) // the goroutine releases the slot
 			continue
@@ -303,7 +321,9 @@ func (a *Agent) start(ctx, deliveryCtx context.Context, job *claimedJob) {
 // shutdown; context.Cause says which, and that decides what is reported.
 func (a *Agent) runAttempt(ctx, deliveryCtx context.Context, job *claimedJob) {
 	key := attemptKey{job.ID, job.Attempt}
-	logger := a.cfg.Logger
+	logger := a.logger().With("run_id", job.RunID, "job_id", job.ID, "attempt", job.Attempt)
+	a.cfg.Metrics.ActiveJobs.Inc()
+	defer a.cfg.Metrics.ActiveJobs.Dec()
 
 	// jctx ends on shutdown (parent) or on a directive (cancel). The
 	// executor gets the timeout-wrapped child.
@@ -320,8 +340,8 @@ func (a *Agent) runAttempt(ctx, deliveryCtx context.Context, job *claimedJob) {
 
 	pj, err := job.spec()
 	if err != nil {
-		logger.Printf("job %s attempt %d: %v", job.ID, job.Attempt, err)
-		a.report(deliveryCtx, job, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: err.Error()})
+		logger.Error("attempt failed before start", "err", err)
+		a.report(deliveryCtx, job, logger, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: err.Error()})
 		return
 	}
 	spec := executor.JobSpec{JobID: job.ID, RunID: job.RunID, Attempt: job.Attempt, Job: pj}
@@ -330,8 +350,8 @@ func (a *Agent) runAttempt(ctx, deliveryCtx context.Context, job *claimedJob) {
 		// from and removed here, whatever happens.
 		dir, err := os.MkdirTemp("", "quarry-artifacts-")
 		if err != nil {
-			logger.Printf("job %s attempt %d: %v", job.ID, job.Attempt, err)
-			a.report(deliveryCtx, job, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: "artifact dir: " + err.Error()})
+			logger.Error("attempt failed before start", "err", err)
+			a.report(deliveryCtx, job, logger, completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: "artifact dir: " + err.Error()})
 			return
 		}
 		defer os.RemoveAll(dir)
@@ -383,7 +403,7 @@ func (a *Agent) runAttempt(ctx, deliveryCtx context.Context, job *claimedJob) {
 		stopFlush()
 	}
 	if err := shipper.Close(flushCtx); err != nil && !aborted && !errors.Is(err, logship.ErrStale) {
-		logger.Printf("job %s attempt %d: logs: %v", job.ID, job.Attempt, err)
+		logger.Warn("final log flush failed", "err", err)
 	}
 	stopFlush()
 
@@ -405,28 +425,32 @@ func (a *Agent) runAttempt(ctx, deliveryCtx context.Context, job *claimedJob) {
 			req = completeRequest{Status: statusFailed, FailureKind: kindExitCode, ExitCode: &code, Error: msg}
 		}
 	case aborted:
-		logger.Printf("job %s attempt %d: aborted by server, result discarded", job.ID, job.Attempt)
+		logger.Info("aborted by server, result discarded")
 		return
 	case ctx.Err() != nil:
 		req = completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: errShutdown.Error()}
 	default:
+		// The executor could not run the job (or the upload failed): the
+		// runner-side error, as opposed to a job that ran and failed.
+		a.cfg.Metrics.ExecutorErrors.Inc()
+		logger.Error("executor error", "err", execErr)
 		req = completeRequest{Status: statusFailed, FailureKind: kindInfra, Error: execErr.Error()}
 	}
-	a.report(deliveryCtx, job, req)
+	a.report(deliveryCtx, job, logger, req)
 }
 
 // report uses Run's delivery context so executor cancellation cannot lose
 // a verdict, while runner shutdown still bounds the reconnect wait.
-func (a *Agent) report(ctx context.Context, job *claimedJob, req completeRequest) {
+func (a *Agent) report(ctx context.Context, job *claimedJob, logger *slog.Logger, req completeRequest) {
 	req.RunnerID = a.RunnerID()
 	req.Attempt = job.Attempt
 	err := a.client.completeWithRetry(ctx, job.ID, req, a.cfg.CompleteRetries, a.cfg.CompleteBackoff)
 	switch {
 	case err == nil:
 	case errors.Is(err, errFenced):
-		a.cfg.Logger.Printf("job %s attempt %d: %v", job.ID, job.Attempt, err)
+		logger.Warn("result rejected, attempt superseded", "err", err)
 	default:
-		a.cfg.Logger.Printf("job %s attempt %d: report %s: %v", job.ID, job.Attempt, req.Status, err)
+		logger.Error("report failed", "status", req.Status, "err", err)
 	}
 }
 
@@ -449,7 +473,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context) {
 		ds, err := a.client.heartbeat(ctx, a.RunnerID(), refs)
 		if err != nil {
 			if ctx.Err() == nil {
-				a.cfg.Logger.Printf("heartbeat: %v", err)
+				a.logger().Warn("heartbeat failed", "err", err)
 			}
 			continue
 		}
