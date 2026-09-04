@@ -106,8 +106,13 @@ func TestAgentArtifactUploadRetriesThenInfra(t *testing.T) {
 	f := executor.NewFake()
 	f.Script("flaky", executor.Outcome{Artifacts: map[string]string{"out.txt": "1"}})
 	f.Script("broken", executor.Outcome{Artifacts: map[string]string{"out.txt": "2"}})
+	// Both jobs' upload replies are scripted up front: flaky pops 500,
+	// 502, 201 and succeeds on its third upload; broken then pops 500s
+	// until CompleteRetries is exhausted. The agent re-claims the moment
+	// a slot frees, so a script written after observing the first
+	// completion could arrive after broken's first upload.
 	s.mu.Lock()
-	s.statuses = []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusCreated}
+	s.statuses = []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusCreated, 500, 500, 500, 500, 500}
 	s.mu.Unlock()
 	a, err := New(func() Config {
 		c := testConfig(s.stubServer, 1)
@@ -126,9 +131,6 @@ func TestAgentArtifactUploadRetriesThenInfra(t *testing.T) {
 	if c := s.completed()[0]; c.JobID != "j-flaky" || c.Req.Status != statusSucceeded {
 		t.Fatalf("flaky = %+v", c)
 	}
-	s.mu.Lock()
-	s.statuses = []int{500, 500, 500, 500, 500}
-	s.mu.Unlock()
 	// The second job is claimed after the first completes (capacity 1).
 	waitFor(t, func() bool { return len(s.completed()) == 2 }, "second completion")
 	c := s.completed()[1]
