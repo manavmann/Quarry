@@ -156,3 +156,193 @@ one extra disk write per artifact — the same cost the local backend pays
 for its temp-and-rename — and buys retries, exact `Content-Length` for
 readers of unknown size (multipart source bundles), and `local`'s
 "nothing stored on failure" semantics unchanged.
+
+## 8. Retry eligibility is a function of `failure_kind` alone
+
+**Decision.** `scheduler.retryable(kind)` is the single place that says
+whether a failed attempt may be claimed again: `infra` and `lost_runner`
+yes, `exit_code`, `timeout` and `cancelled` no — and only while
+`attempt < max_attempts` and no cancel is pending. `max_attempts` counts
+claims (the attempt number is bumped on claim, kept on requeue), is
+stamped on every job at submission from `QUARRY_MAX_ATTEMPTS`, and the
+runner cannot report `lost_runner` at all (`400`).
+
+**Alternative.** Let the runner decide (`retryable: true` in the
+completion body), or pattern-match the error message ("pull failed",
+"connection reset") server-side, or a per-job `retries:` field.
+
+**Why it lost.** A runner that is confused enough to fail an attempt is
+not the right party to judge whether the platform should hide that; and
+a message heuristic is a list that never stops growing. Splitting the
+kinds by *whose fault it was* gives one predicate the monitor, `Complete`
+and the tests all share, and makes "a failing test is never retried" a
+one-line property rather than a policy. A per-job override can be added
+later as an input to the same predicate.
+
+## 9. The lease monitor is a periodic single-transaction tick, not per-lease timers
+
+**Decision.** `scheduler.Tick` runs every `MonitorInterval` (5 s), reads
+`now` from the store's injected clock once, and in one `BEGIN IMMEDIATE`
+transaction expires every lease strictly before `now`, applies the
+timeout backstop, and marks silent runners offline. It selects nothing
+the previous tick changed, so it is idempotent; a failed tick is retried
+by the next one. `RunMonitor` is a goroutine owned by `cmd/server`'s
+`run()` and the ticker only paces it.
+
+**Alternative.** A `time.AfterFunc` per claim that fires at
+`lease_expires_at`; or SQLite triggers; or checking expiry lazily inside
+`Claim`.
+
+**Why it lost.** Per-lease timers are in-memory state that a server
+restart loses and a fake clock cannot drive; they also race the
+heartbeat that extends the lease. A tick reads the one source of truth
+(the row's `lease_expires_at`) and needs no recovery step after a
+restart. Lazy expiry in `Claim` would never fire on an idle cluster, so
+the last job of a run whose runner died would sit `running` for ever.
+The cost is up to one interval of extra latency (5 s on a 30 s TTL),
+which the benchmarks show as TTL + ~2 s in practice.
+
+## 10. A fenced-out runner aborts silently; the server never hears about it
+
+**Decision.** When any of the four write paths says `abort`/`409`, the
+runner cancels the attempt's context with the abort cause, kills and
+removes the container, discards the shipper's buffer, sends nothing
+further — not even `complete` — and frees the slot. There is no
+"attempt aborted" endpoint or event.
+
+**Alternative.** `POST …/aborted` so the server can record that a zombie
+existed, or letting the zombie's `complete` through as an informational
+`failed(superseded)`.
+
+**Why it lost.** From the store's point of view the attempt ended when
+its lease expired and the monitor requeued it; the runner is catching up
+with a decision already made, and nothing it could say would change any
+row. Anything it *did* write would either be rejected by the same fence
+(so the endpoint is pointless) or would have to bypass it (so the fence
+would have a hole). The 409s the server returns are the complete record
+of the zombie; the monitor's `job.requeued {runner_id}` event already
+names the runner that was lost.
+
+## 11. Cancel rides on the heartbeat, and every kill is a context cause
+
+**Decision.** `POST /api/runs/{id}/cancel` only writes
+`cancel_requested_at / cancel_reason` on running jobs; the runner learns
+of it as the `cancel` directive on its next heartbeat. Runner-side,
+cancel, abort, job timeout and runner shutdown all end the attempt the
+same way — `context.CancelCause` on the attempt's context — and
+`context.Cause` decides what, if anything, is reported: `failed(timeout)`,
+`failed(cancelled)`, nothing, or `failed(infra)`.
+
+**Alternative.** A server→runner push channel (long-poll or WebSocket)
+so cancel is immediate; or a `Kill()` method on the executor.
+
+**Why it lost.** A push channel is the one thing the pull-based design
+was chosen to avoid: it needs connection state on the server, reconnect
+logic on both sides, and a story for what a cancel means when the
+channel is down. The heartbeat already exists, is already fenced, and
+bounds cancel latency at one interval (5 s) plus kill time — the same
+budget as lease renewal. A `Kill()` method would make `Executor` a
+two-method interface and give the docker package a second code path for
+the same operation; killing via the context keeps it at one and makes
+the fake executor's behaviour identical.
+
+The same directive carries the monitor's timeout backstop: a running
+job past `started_at + timeout + 30 s` gets `cancel_reason=timeout`,
+the runner kills and reports `failed(cancelled)` exactly as for a user
+cancel, and `Complete` consults `cancel_reason` to store `failed(timeout)`
+instead of `cancelled`. A third `timeout` directive would only change
+the label the runner echoes back; who asked for the kill is knowledge
+the server already holds in the row, and storing a backstop as
+`cancelled` would make a timed-out run look like a user action and let a
+timeout dodge the never-retried rule by accident.
+
+## 12. One lease TTL of grace after a control-plane restart, no state recovery
+
+**Decision.** `scheduler.New` sets `leaseGraceUntil = now + LeaseTTL`
+from the injected clock; until then `Tick` skips lease expiry entirely
+(including leases that expired during the outage) while the timeout
+backstop and offline marking still run. Nothing else is recovered on
+boot: the row is the truth, the runner heartbeats renew it, and after
+grace unrenewed leases expire normally.
+
+**Alternative.** Requeue every `running` job on boot ("the server was
+down, assume the worst"); or persist the monitor's last tick time and
+extend leases by the measured downtime.
+
+**Why it lost.** Requeue-on-boot turns every server restart into a
+duplicate execution of every in-flight job, which is exactly the
+at-least-once cost the lease protocol is meant to minimise; a runner
+that kept running through a 35 s outage still has a valid container and
+will report a result that would then be fenced out for no reason.
+Extending by measured downtime needs a persisted clock and is wrong the
+moment the server's wall clock jumps. One TTL of grace is the longest a
+live runner can need to renew, needs no state, and is proven by
+`TestServerRestartAfterLeaseTTL`: the original attempts finish once,
+with one claim and no requeue.
+
+## 13. Reconnect for ever while alive, bounded only by shutdown
+
+**Decision.** Agent, log shipper and CLI wrap every call in a reconnect
+loop: a transport error waits with exponential backoff capped at 10 s
+and retries until the context ends; HTTP replies are handled by the
+caller. Only 5xx replies consume the completion retry budget (8 tries);
+409 and other 4xx are final. After `SIGTERM` the runner gets
+`LogFlushTimeout` (30 s) to deliver final logs and verdicts, then stops.
+Source and artifact downloads restart into a temp file after a partial
+read so a consumer never sees a truncated stream.
+
+**Alternative.** A fixed retry budget for everything (give up after N
+transport failures), or no retry at all with the lease monitor as the
+only recovery path.
+
+**Why it lost.** A finished attempt's verdict is the most valuable byte
+the runner holds; dropping it after N failed connects converts a
+30-second network blip into a wasted attempt plus a full lease TTL of
+delay. While the runner is alive the lease is still being renewed (the
+heartbeat retries the same way), so waiting costs nothing; the moment
+the runner is shutting down the wait must end, and `LogFlushTimeout` is
+that bound. Distinguishing transport errors from HTTP errors keeps the
+budget meaningful: a server that answers 500 eight times is broken in a
+way retrying will not fix.
+
+## 14. The orphan reaper matches on the runner's own name only
+
+**Decision.** On startup `docker.Executor.Reap` lists containers and
+volumes labelled `quarry.runner=<this runner's name>` and force-removes
+them, containers before volumes. Other runners' labels are never
+touched, and under `QUARRY_KEEP_FAILED` the reaper logs and does nothing.
+
+**Alternative.** Reap everything labelled `quarry.job`, or reap by age,
+or ask the server which attempts are still running.
+
+**Why it lost.** Runners on a compose host share one daemon; reaping by
+`quarry.job` would let `runner-1` restarting kill `runner-2`'s live
+attempt. Age is a guess. Asking the server needs the reaper to run after
+registration and to trust a "still running" answer that a lease
+expiry can invalidate a second later. The runner's own name is the one
+label whose owner is unambiguous: anything under it belongs to a
+previous incarnation of *this* process, which by construction is dead.
+`KeepFailed` is a debugging switch, and a debugging switch that erased
+the thing you were debugging on restart would be worse than none.
+
+## 15. Fault injection lives in the harness transport and the fake clock
+
+**Decision.** `internal/harness` gives every in-process agent its own
+HTTP transport with switches — `MuteHeartbeats(i)` drops heartbeats
+only, `HardKill(i)` drops every request, cancels the agent's attempts
+and reports nothing, `Kill(i)` is a clean shutdown — and the server's
+clock is a fake stepped by the test. The stress suite kills runners this
+way and walks the clock 1 s at a time until no dead runner holds a
+lease.
+
+**Alternative.** Spawn real runner processes and `SIGKILL` them; use
+real time with short TTLs.
+
+**Why it lost.** Real processes make "the runner is dead but its last
+claim is still in flight" untestable rather than merely hard — the C19
+stress test found exactly that interleaving, and only because the
+harness could step time and observe leases between steps. Short real
+TTLs make every test a race against the scheduler on a loaded CI box,
+which is how `time.Sleep` gets into a test suite. The compose cluster
+and `scripts/bench/runner-loss.sh` cover the real-process case as a
+benchmark, not as a correctness test.
