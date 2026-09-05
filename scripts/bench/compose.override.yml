@@ -1,0 +1,7 @@
+# Compose override for scripts/bench/log-ingest.sh: the 50 MB log job
+# needs a per-attempt log cap above the server's 10 MiB default. Used as
+#   docker compose -f deploy/docker-compose.yml -f scripts/bench/compose.override.yml up
+services:
+  server:
+    environment:
+      QUARRY_LOG_CAP: ${QUARRY_LOG_CAP:-268435456}

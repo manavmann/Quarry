@@ -269,14 +269,16 @@ func (h *Harness) startAgent(i int) {
 	}()
 }
 
-// stopAgent is a no-op for an agent that is already stopped.
+// stopAgent is a no-op for an agent that is already stopped; one that was
+// hard-killed is only joined.
 func (h *Harness) stopAgent(i int) {
 	r := h.ags[i]
-	if r.stop == nil {
-		return
+	if r.stop != nil {
+		r.stop()
 	}
-	r.stop()
-	<-r.done
+	if r.done != nil {
+		<-r.done
+	}
 	r.stop, r.done = nil, nil
 }
 
@@ -287,12 +289,35 @@ func (h *Harness) Kill(i int) {
 	h.stopAgent(i)
 }
 
+// HardKill stops agent i the way SIGKILL would: from now on none of its
+// requests reach the server, so a completion for a killed attempt is
+// lost rather than delivered as an infra failure, and its leases expire
+// only when the fake clock passes the TTL. Unlike Kill it does not wait
+// for the agent's goroutines (they spend LogFlushTimeout retrying against
+// the dead transport); Restart or cleanup joins them.
+func (h *Harness) HardKill(i int) {
+	h.t.Helper()
+	r := h.ags[i]
+	if r.stop == nil {
+		h.t.Fatalf("HardKill(%d): agent is not running", i)
+	}
+	r.net.dead.Store(true)
+	r.stop()
+	r.stop = nil
+}
+
 // Restart brings agent i back with the same id and executor.
 func (h *Harness) Restart(i int) {
 	h.t.Helper()
-	if h.ags[i].stop != nil {
+	r := h.ags[i]
+	if r.stop != nil {
 		h.t.Fatalf("Restart(%d): agent is running", i)
 	}
+	if r.done != nil {
+		<-r.done
+		r.done = nil
+	}
+	r.net.dead.Store(false)
 	h.startAgent(i)
 }
 
@@ -304,13 +329,19 @@ func (h *Harness) Restart(i int) {
 func (h *Harness) MuteHeartbeats(i int, mute bool) { h.ags[i].net.muteHB.Store(mute) }
 
 // agentTransport is one agent's network path to the server. It drops
-// heartbeats while muteHB is set; everything else goes through the
-// default transport.
-type agentTransport struct{ muteHB atomic.Bool }
+// heartbeats while muteHB is set and everything while dead is set; the
+// rest goes through the default transport.
+type agentTransport struct{ muteHB, dead atomic.Bool }
 
-var errMuted = errors.New("harness: heartbeat dropped")
+var (
+	errMuted = errors.New("harness: heartbeat dropped")
+	errDead  = errors.New("harness: runner is dead")
+)
 
 func (t *agentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.dead.Load() {
+		return nil, errDead
+	}
 	if t.muteHB.Load() && strings.HasSuffix(req.URL.Path, "/api/runner/heartbeat") {
 		return nil, errMuted
 	}
