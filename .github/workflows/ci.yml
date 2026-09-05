@@ -37,7 +37,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: docker compose -f deploy/docker-compose.yml up -d --build --wait
+      # build each image once before up: `up --build` races on a cold cache (README)
+      - run: docker compose -f deploy/docker-compose.yml build server runner-1
+      - run: docker compose -f deploy/docker-compose.yml up -d --wait
       - run: go build -o bin/quarry ./cmd/quarry
       - name: quarry run --wait (cold cache, 2 min budget)
         run: timeout 120 bin/quarry run --wait -C examples/go-app
@@ -48,6 +50,8 @@ jobs:
           test "$(docker compose -f deploy/docker-compose.yml ps --format '{{.Health}}' | grep -c healthy)" = 4
       - name: demo script end to end
         run: timeout 300 scripts/demo.sh
+      - name: demo script, kill-runner beat (runner lost mid-job -> attempt 2 elsewhere)
+        run: timeout 300 scripts/demo.sh kill-runner
       - name: no job containers or volumes left behind
         run: |
           test "$(docker ps -aq --filter label=quarry.job | wc -l)" = 0

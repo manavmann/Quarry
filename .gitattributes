@@ -1,0 +1,4 @@
+# LF everywhere, whatever core.autocrlf says: gofmt, sh and the job
+# containers all see the working tree as checked out.
+* text=auto eol=lf
+*.gif binary

@@ -1,6 +1,7 @@
 # Quarry demo cluster: one control plane + three Docker-executor runners.
 #
-#   docker compose -f deploy/docker-compose.yml up -d --build --wait
+#   docker compose -f deploy/docker-compose.yml build server runner-1  # once per image; see README
+#   docker compose -f deploy/docker-compose.yml up -d --wait
 #   QUARRY_TOKEN=dev-token quarry run --wait -C examples/go-app
 #
 # Default profile has no external dependencies: SQLite and the local
@@ -11,7 +12,8 @@
 # coordinator + three storage nodes, RF=3, W=2) and points the server's
 # artifact store at it. Both the profile and the backend switch are needed:
 #
-#   COMPOSE_PROFILES=remote QUARRY_ARTIFACT_BACKEND=remote \n#     docker compose -f deploy/docker-compose.yml up -d --build --wait
+#   COMPOSE_PROFILES=remote QUARRY_ARTIFACT_BACKEND=remote \
+#     docker compose -f deploy/docker-compose.yml up -d --wait
 #
 # The coordinator is published on  so
 # `QUARRY_TEST_REMOTE_URL=http://127.0.0.1:8090 make test-docker` runs the
@@ -22,7 +24,11 @@
 # three runners every 5 s (deploy/prometheus.yml), published on
 # $QUARRY_PROMETHEUS_PORT (default 9090). No Grafana, no dashboards:
 #
-#   COMPOSE_PROFILES=prometheus docker compose -f deploy/docker-compose.yml up -d --build --wait
+#   COMPOSE_PROFILES=prometheus docker compose -f deploy/docker-compose.yml up -d --wait
+
+# Project name, so containers are quarry-* and a sibling `deploy/` directory
+# in another checkout does not share the project.
+name: quarry
 
 x-storage-node: &storage-node
   image: ${QUARRY_STORAGE_IMAGE:-ghcr.io/manavmann/distributed-object-storage:latest}
