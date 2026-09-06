@@ -1,5 +1,5 @@
--- 0004_artifacts: one row per uploaded artifact file (blueprint §9). A row
--- exists only once the bytes are in the ArtifactStore under
+-- 0004_artifacts: one row per uploaded artifact file. A row exists only
+-- once the bytes are in the ArtifactStore under
 -- runs/<run>/jobs/<job>/<attempt>/<path>; the primary key makes a
 -- redelivered upload an overwrite of the same row.
 CREATE TABLE artifacts (

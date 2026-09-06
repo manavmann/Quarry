@@ -1,7 +1,7 @@
 // Package api is the control plane's HTTP surface. Handlers translate
 // HTTP into store calls and store rows into JSON; they hold no business
-// logic. This file covers the user endpoints (blueprint §10); runner.go
-// covers the runner protocol under /api/runner/* (docs/protocol.md).
+// logic. This file covers the user endpoints; runner.go covers the
+// runner protocol under /api/runner/* (docs/protocol.md).
 package api
 
 import (

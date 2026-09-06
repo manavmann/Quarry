@@ -29,7 +29,7 @@ const DefaultLeaseTTL = 30 * time.Second
 const DefaultLogCapBytes = 10 << 20
 
 // DefaultMaxAttempts is how many claims a job gets before an infra or
-// lost_runner failure becomes terminal (blueprint §13).
+// lost_runner failure becomes terminal.
 const DefaultMaxAttempts = 3
 
 // DefaultMonitorInterval is how often the lease monitor ticks.

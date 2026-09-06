@@ -1,4 +1,5 @@
-// Disposable spike: validates Docker Engine SDK assumptions before C07.
+// Disposable spike: validates Docker Engine SDK assumptions used by
+// internal/executor/docker.
 // NOT part of any real package. Run with: cd spike && go run .
 package main
 

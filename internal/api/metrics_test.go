@@ -33,7 +33,7 @@ func wantSeries(t *testing.T, out string, series ...string) {
 }
 
 // /metrics shows the queue depth change as a run is submitted, claimed
-// and completed (C18's verify line), with the counters that go with it.
+// and completed, with the counters that go with it.
 func TestMetricsQueueDepthChangesDuringRun(t *testing.T) {
 	srv, _ := newTestServer(t)
 	out := scrapeMetrics(t, srv)

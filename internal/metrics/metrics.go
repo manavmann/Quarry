@@ -1,7 +1,7 @@
-// Package metrics holds the Prometheus registries of the two binaries
-// (blueprint §18). Each set lives on its own registry so tests can build
-// any number of servers or agents without duplicate-registration panics,
-// and Handler serves it in the exposition format.
+// Package metrics holds the Prometheus registries of the two binaries.
+// Each set lives on its own registry so tests can build any number of
+// servers or agents without duplicate-registration panics, and Handler
+// serves it in the exposition format.
 //
 // The server set is updated by the scheduler at every state transition;
 // its two gauges (queue depth, runners by state) are read from the store

@@ -15,8 +15,8 @@ import (
 	"quarry/internal/store"
 )
 
-// Artifact endpoints (blueprint §11, docs/protocol.md). The server is the
-// only writer to the artifact store: runners stream each file to
+// Artifact endpoints (docs/protocol.md). The server is the only writer
+// to the artifact store: runners stream each file to
 // POST /api/runner/jobs/{id}/attempts/{attempt}/artifacts/{path...}, the
 // body goes straight through to Store.Put (never buffered), and only then
 // is the artifacts row written — inside one transaction with the

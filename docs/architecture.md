@@ -118,8 +118,7 @@ so live runners can renew leases that expired during the outage. See
 Every write to a job by a runner is fenced on `(state='running',
 attempt)`; every state transition is one store transaction; timestamps
 are Unix milliseconds generated in Go from an injected clock. See
-`CLAUDE.md` for the full invariant list and `docs/design-decisions.md`
-for why.
+`docs/design-decisions.md` for why.
 
 ## Deployment shape
 
@@ -166,4 +165,4 @@ every 5 s from `deploy/prometheus.yml`; there is no Grafana and no tracing.
 ## Not yet
 
 Artifact retention and GC, `web/`, control-plane HA, a `quarry` CLI
-image. Known gaps per commit are tracked in `docs/progress.md`.
+image.

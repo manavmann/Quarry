@@ -14,7 +14,7 @@ import (
 )
 
 // stressWorkers is the width of the fan-out: src → 48 workers → sink is
-// the 50-job pipeline of the C19 stress test.
+// the 50-job pipeline the stress tests run.
 const stressWorkers = 48
 
 // stressPipeline is src → w-00..w-47 → sink.

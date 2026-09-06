@@ -25,7 +25,7 @@ jobs:
       - run: go test -race ./...
       - run: make build
 
-  # C11: fresh clone -> docker compose up -> quarry run --wait in < 2 min
+  # Fresh clone -> docker compose up -> quarry run --wait in < 2 min
   # on a cold image cache, then the demo script end to end.
   compose:
     runs-on: ubuntu-latest

@@ -571,8 +571,8 @@ func TestRunnerLogsIngestAndCursorRead(t *testing.T) {
 }
 
 // TestSubmitMultipart covers the CLI's submit shape: the pipeline as the
-// "pipeline" part and the workspace bundle as "source", which is drained
-// until C10 stores it. A multipart body without a pipeline part is 400.
+// "pipeline" part and the workspace bundle as "source", which is streamed
+// into the artifact store. A multipart body without a pipeline part is 400.
 func TestSubmitMultipart(t *testing.T) {
 	srv, _ := newTestServer(t)
 

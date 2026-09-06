@@ -16,10 +16,10 @@ import (
 	"quarry/internal/executor"
 )
 
-// Artifact collection (blueprint §11): after a zero exit, each declared
-// artifact path is copied out of the container with CopyFromContainer and
-// unpacked under spec.ArtifactDir; the runner uploads from there. The
-// executor never talks to the API.
+// Artifact collection: after a zero exit, each declared artifact path is
+// copied out of the container with CopyFromContainer and unpacked under
+// spec.ArtifactDir; the runner uploads from there. The executor never
+// talks to the API.
 //
 // CopyFromContainer returns a tar whose entries are relative to the
 // PARENT of the requested path and prefixed with its basename: asking for

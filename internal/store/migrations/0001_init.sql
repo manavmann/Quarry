@@ -1,5 +1,5 @@
--- 0001_init: runs, jobs, job_deps, runners, events (blueprint §9 minus
--- log_chunks and artifacts, which land in C08 and C10).
+-- 0001_init: runs, jobs, job_deps, runners, events. log_chunks and
+-- artifacts have their own migrations (0003, 0004).
 -- All timestamps are Unix milliseconds generated in Go; SQL never
 -- produces a timestamp.
 

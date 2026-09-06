@@ -101,7 +101,7 @@ expiry (running → queued) and the next claim the old attempt number is
 still the latest, and only the state check rejects the lost runner's
 write in that window. Checking two columns the job row already has costs
 nothing, needs no extra table, and makes the rule the same for all four
-write paths — which is why it is an invariant in `CLAUDE.md`.
+write paths.
 
 ## 6. One container per job running a generated `run.sh`, not `sh -c` strings
 
@@ -144,9 +144,9 @@ only guards its node-to-coordinator heartbeat, not `/v1`). The compose
 with the coordinator behind an S3-compatible shim; or stream the request
 body straight through to the coordinator with no spool.
 
-**Why it lost.** A client import would be the first dependency that is
-not on the approved list and would tie Quarry's build to the other
-project's module path and rename-in-progress; the API surface Quarry
+**Why it lost.** A client import would be a sixth dependency and would
+tie Quarry's build to the other project's module path and
+rename-in-progress; the API surface Quarry
 needs is five routes and one error shape. Straight-through streaming
 cannot retry: the API handler hands `Put` a one-shot request body, so an
 `InsufficientReplicas` after the bytes are consumed would have to be
@@ -339,9 +339,9 @@ lease.
 real time with short TTLs.
 
 **Why it lost.** Real processes make "the runner is dead but its last
-claim is still in flight" untestable rather than merely hard — the C19
-stress test found exactly that interleaving, and only because the
-harness could step time and observe leases between steps. Short real
+claim is still in flight" untestable rather than merely hard — the
+harness stress suite found exactly that interleaving, and only because
+the harness could step time and observe leases between steps. Short real
 TTLs make every test a race against the scheduler on a loaded CI box,
 which is how `time.Sleep` gets into a test suite. The compose cluster
 and `scripts/bench/runner-loss.sh` cover the real-process case as a
