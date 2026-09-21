@@ -50,7 +50,7 @@ started again and reaps the container it left behind.
 Needs Docker with compose v2 and Go 1.27 — nothing else is installed.
 
 ```sh
-git clone https://github.com/manavmann/distributed-ci-cd-platform.git
+git clone https://github.com/manavmann/quarry.git
 cd distributed-ci-cd-platform
 scripts/demo.sh                 # build the CLI, start 1 server + 3 runners, run examples/go-app
 scripts/demo.sh kill-runner     # the recording above: SIGKILL a runner mid-job
