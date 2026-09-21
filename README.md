@@ -1,6 +1,6 @@
 # Quarry
 
-[![ci](https://github.com/manavmann/distributed-ci-cd-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/manavmann/distributed-ci-cd-platform/actions/workflows/ci.yml)
+[![ci](https://github.com/manavmann/quarry/actions/workflows/ci.yml/badge.svg)](https://github.com/manavmann/quarry/actions/workflows/ci.yml)
 
 A distributed CI/CD platform in Go. A control plane turns a `.quarry.yml`
 pipeline into a DAG and hands its jobs to a fleet of pull-based runners
